@@ -51,7 +51,11 @@
 #   sudo bash xray-setup.sh --uninstall          # remove this package only
 #
 # Env knobs:
-#   XRAY_VERSION       pinned core version        (default 26.10.31)
+#   XRAY_VERSION       core version: a version number, or "latest" for the
+#                      newest GitHub release (default: the version pinned by
+#                      this script; once a core is installed, its version is
+#                      recorded in state and re-runs keep it — no silent
+#                      downgrade after a manual core upgrade)
 #   XRAY_PORT          listen port                (default 443; in both mode
 #                      this is the external inbound's port)
 #   XRAY_SELF_PORT     self inbound port in both mode (default 8443)
@@ -74,7 +78,8 @@
 
 set -u
 
-XRAY_VERSION="${XRAY_VERSION:-26.10.31}"
+XRAY_VERSION="${XRAY_VERSION:-}"
+PIN_VERSION="26.10.31"
 XRAY_PORT="${XRAY_PORT:-443}"
 XRAY_SELF_PORT="${XRAY_SELF_PORT:-8443}"
 XRAY_DEST_MODE="${XRAY_DEST_MODE:-external}"
@@ -132,6 +137,7 @@ LINK_HOST=${LINK_HOST_SAVED}
 SELF_PORT=${SELF_PORT_SAVED:-}
 SELF_SNI=${SELF_SNI_SAVED:-}
 FALLBACK=${FALLBACK_KIND:-python}
+CORE_VERSION=${XRAY_VERSION:-}
 EOF
   chmod 600 "$STATE"
 }
@@ -211,6 +217,25 @@ fetch() { # url dest
   else die "need curl or wget to download Xray-core"; fi
 }
 
+resolve_core_version() {
+  # Priority: explicit XRAY_VERSION env (a version number, or "latest")
+  # > the version recorded in state (re-runs must never silently downgrade
+  # a core the user upgraded) > this script's pinned version.
+  if [ -z "$XRAY_VERSION" ] && [ -f "$STATE" ]; then
+    XRAY_VERSION="$( . "$STATE" >/dev/null 2>&1; printf '%s' "${CORE_VERSION:-}" )"
+  fi
+  if [ "$XRAY_VERSION" = "latest" ]; then
+    local tag
+    tag="$(curl -fsSL --max-time 20 https://api.github.com/repos/XTLS/Xray-core/releases/latest 2>/dev/null \
+           | sed -n 's/.*"tag_name":[[:space:]]*"v\?\([0-9.]*\)".*/\1/p' | head -n1)"
+    [ -n "$tag" ] || die "could not query the latest Xray-core release from GitHub — check the network, or pass an explicit XRAY_VERSION"
+    say "Latest Xray-core release on GitHub: $tag"
+    XRAY_VERSION="$tag"
+  fi
+  XRAY_VERSION="${XRAY_VERSION:-$PIN_VERSION}"
+  case "$XRAY_VERSION" in ''|*[!0-9.]*) die "invalid core version: $XRAY_VERSION";; esac
+}
+
 install_xray() {
   if [ -x "$BIN" ] && [ -z "${XRAY_BIN:-}" ]; then
     local cur
@@ -219,7 +244,7 @@ install_xray() {
       say "Xray $XRAY_VERSION already installed at $BIN — skipping download."
       return 0
     fi
-    say "Replacing Xray ${cur:-unknown} at $BIN with pinned $XRAY_VERSION."
+    say "Replacing Xray ${cur:-unknown} at $BIN with $XRAY_VERSION."
   fi
   [ -n "${XRAY_BIN:-}" ] && { say "Using provided xray binary: $BIN"; return 0; }
 
@@ -687,11 +712,12 @@ show_menu() {
     say "  3) restart services"
     say "  4) recent logs"
     say "  5) upgrade script (download latest, re-run, credentials kept)"
+    say "  6) upgrade Xray core to latest GitHub release"
     if [ "${MODE:-}" = "self" ] || [ "${MODE:-}" = "both" ]; then
       other="nginx"; [ "${FALLBACK:-python}" = "nginx" ] && other="python"
-      say "  6) switch fallback to ${other}"
+      say "  7) switch fallback to ${other}"
     fi
-    say "  7) uninstall"
+    say "  8) uninstall"
     say "  0) exit"
     printf 'choice: '
     read -r choice || return 0
@@ -709,10 +735,12 @@ show_menu() {
          else
            say "download failed — staying on the current version."
          fi ;;
-      6) [ "${MODE:-}" = "self" ] || [ "${MODE:-}" = "both" ] || { say "external mode has no fallback."; continue; }
+      6) say "Re-running with XRAY_VERSION=latest..."
+         menu_rerun "XRAY_VERSION=latest" ;;
+      7) [ "${MODE:-}" = "self" ] || [ "${MODE:-}" = "both" ] || { say "external mode has no fallback."; continue; }
          say "Re-running with XRAY_FALLBACK=${other}..."
          menu_rerun "XRAY_FALLBACK=${other}" ;;
-      7) printf 'uninstall everything? [y/N] '; read -r yn || yn=""
+      8) printf 'uninstall everything? [y/N] '; read -r yn || yn=""
          case "$yn" in y|Y) do_uninstall ;; *) say "cancelled." ;; esac ;;
       0) return 0 ;;
       *) say "invalid choice" ;;
@@ -757,7 +785,7 @@ case "$XRAY_DEST_MODE" in external|self|both) ;; *) die "XRAY_DEST_MODE must be 
 # previous run recorded in state; otherwise python.
 FALLBACK_KIND="$XRAY_FALLBACK"
 if [ -z "$FALLBACK_KIND" ] && [ -f "$STATE" ]; then
-  FALLBACK_KIND="$( ( . "$STATE" ) >/dev/null 2>&1; printf '%s' "${FALLBACK:-python}" )"
+  FALLBACK_KIND="$( . "$STATE" >/dev/null 2>&1; printf '%s' "${FALLBACK:-python}" )"
 fi
 FALLBACK_KIND="${FALLBACK_KIND:-python}"
 case "$FALLBACK_KIND" in python|nginx) ;; *) die "XRAY_FALLBACK must be 'python' or 'nginx'";; esac
@@ -780,6 +808,7 @@ check_port_free "$XRAY_PORT"
 [ "$XRAY_DEST_MODE" = "both" ] && check_port_free "$XRAY_SELF_PORT"
 
 ensure_deps
+resolve_core_version
 install_xray
 mkdir -p "$CONF_DIR" "$UNIT_DIR"
 
