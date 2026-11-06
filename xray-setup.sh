@@ -10,12 +10,17 @@
 #   - UUID / REALITY keypair / shortId are generated on first run, saved to
 #     state.env (0600), and reused on re-runs — re-running never rotates
 #     credentials, so already-imported clients keep working.
-#   - Two dest modes:
+#   - Three dest modes:
 #       external (default): dest = files.pythonhosted.org:443 (Fastly, not in
 #         any known script default pool), SNI = files.pythonhosted.org
 #       self: your own domain (Cloudflare DNS-only / grey cloud is fine).
 #         A local fallback HTTPS site (127.0.0.1:10443, python3) serves your
 #         domain's real certificate; dest = 127.0.0.1:10443, SNI = domain.
+#       both: install BOTH inbounds in the same Xray process — external on
+#         XRAY_PORT (default 443) and self on XRAY_SELF_PORT (default 8443),
+#         sharing one UUID / keypair / shortId; two client links are printed.
+#         (One REALITY inbound carries exactly one dest, so "combined" means
+#         two inbounds side by side, like v2ray-agent's combined install.)
 #   - minClientVer defaults to 26.0.0 (strict): only current-generation
 #     Xray-core clients are accepted. sing-box based clients (Karing etc.,
 #     which report an old hardcoded version) are rejected — that is the
@@ -29,13 +34,16 @@
 # Usage:
 #   sudo bash xray-setup.sh                      # external dest mode
 #   sudo XRAY_DEST_MODE=self XRAY_DOMAIN=node.example.com bash xray-setup.sh
+#   sudo XRAY_DEST_MODE=both XRAY_DOMAIN=node.example.com bash xray-setup.sh
 #   sudo bash xray-setup.sh --print-link         # re-print client link only
 #   sudo bash xray-setup.sh --uninstall          # remove this package only
 #
 # Env knobs:
 #   XRAY_VERSION       pinned core version        (default 26.10.31)
-#   XRAY_PORT          listen port                (default 443)
-#   XRAY_DEST_MODE     external | self            (default external)
+#   XRAY_PORT          listen port                (default 443; in both mode
+#                      this is the external inbound's port)
+#   XRAY_SELF_PORT     self inbound port in both mode (default 8443)
+#   XRAY_DEST_MODE     external | self | both     (default external)
 #   XRAY_DEST_HOST     external dest host         (default files.pythonhosted.org)
 #   XRAY_DOMAIN        your domain (self mode, required there)
 #   XRAY_CERT/XRAY_KEY explicit cert paths (self mode; else auto-detected)
@@ -48,6 +56,7 @@ set -u
 
 XRAY_VERSION="${XRAY_VERSION:-26.10.31}"
 XRAY_PORT="${XRAY_PORT:-443}"
+XRAY_SELF_PORT="${XRAY_SELF_PORT:-8443}"
 XRAY_DEST_MODE="${XRAY_DEST_MODE:-external}"
 XRAY_DEST_HOST="${XRAY_DEST_HOST:-files.pythonhosted.org}"
 XRAY_DOMAIN="${XRAY_DOMAIN:-}"
@@ -95,6 +104,8 @@ PORT=${PORT_SAVED}
 MODE=${MODE_SAVED}
 SNI=${SNI_SAVED}
 LINK_HOST=${LINK_HOST_SAVED}
+SELF_PORT=${SELF_PORT_SAVED:-}
+SELF_SNI=${SELF_SNI_SAVED:-}
 EOF
   chmod 600 "$STATE"
 }
@@ -235,21 +246,16 @@ EOF
 }
 
 # --------------------------------------------------------------- config ----
-write_config() { # dest sni
-  local dest="$1" sni="$2" minline=""
-  if [ -n "$XRAY_MIN_CLIENT_VER" ]; then
-    minline="          \"minClientVer\": \"${XRAY_MIN_CLIENT_VER}\","
-  fi
-  mkdir -p "$CONF_DIR"
-  # NOTE: the temp name must end in .json — xray detects the config format
-  # from the file extension and refuses ".tmp".
-  cat > "${CONF_DIR}/.config.tmp.json" <<EOF
-{
-  "log": { "loglevel": "warning" },
-  "inbounds": [
+MINLINE=""
+if [ -n "$XRAY_MIN_CLIENT_VER" ]; then
+  MINLINE="          \"minClientVer\": \"${XRAY_MIN_CLIENT_VER}\","
+fi
+
+inbound_json() { # port dest sni — prints one inbound object
+  cat <<EOF
     {
       "listen": "0.0.0.0",
-      "port": ${XRAY_PORT},
+      "port": $1,
       "protocol": "vless",
       "settings": {
         "clients": [ { "id": "${UUID}", "flow": "xtls-rprx-vision" } ],
@@ -260,16 +266,38 @@ write_config() { # dest sni
         "security": "reality",
         "realitySettings": {
           "show": false,
-          "dest": "${dest}",
+          "dest": "$2",
           "xver": 0,
-          "serverNames": [ "${sni}" ],
+          "serverNames": [ "$3" ],
           "privateKey": "${PRIVATE_KEY}",
-${minline}
+${MINLINE}
           "shortIds": [ "${SHORT_ID}" ]
         }
       },
       "sniffing": { "enabled": true, "destOverride": [ "http", "tls", "quic" ], "routeOnly": true }
     }
+EOF
+}
+
+write_config() {
+  local inbounds=""
+  case "$XRAY_DEST_MODE" in
+    external)
+      inbounds="$(inbound_json "$XRAY_PORT" "${XRAY_DEST_HOST}:443" "$XRAY_DEST_HOST")" ;;
+    self)
+      inbounds="$(inbound_json "$XRAY_PORT" "127.0.0.1:${FALLBACK_PORT}" "$XRAY_DOMAIN")" ;;
+    both)
+      inbounds="$(inbound_json "$XRAY_PORT" "${XRAY_DEST_HOST}:443" "$XRAY_DEST_HOST"),
+$(inbound_json "$XRAY_SELF_PORT" "127.0.0.1:${FALLBACK_PORT}" "$XRAY_DOMAIN")" ;;
+  esac
+  mkdir -p "$CONF_DIR"
+  # NOTE: the temp name must end in .json — xray detects the config format
+  # from the file extension and refuses ".tmp".
+  cat > "${CONF_DIR}/.config.tmp.json" <<EOF
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+${inbounds}
   ],
   "outbounds": [
     { "protocol": "freedom", "tag": "direct" },
@@ -322,49 +350,89 @@ public_ipv4() {
   case "$ip" in *[!0-9.]*|'') echo "";; *) echo "$ip";; esac
 }
 
+make_link() { # host port sni tag
+  echo "vless://${UUID}@$1:$2?encryption=none&security=reality&sni=$3&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&spx=%2F&type=tcp&flow=xtls-rprx-vision#$4"
+}
+
 print_link() {
-  local link="vless://${UUID}@${LINK_HOST_SAVED}:${PORT_SAVED}?encryption=none&security=reality&sni=${SNI_SAVED}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&spx=%2F&type=tcp&flow=xtls-rprx-vision#xray-reality"
+  local links="" info_blocks=""
+  case "$MODE_SAVED" in
+    external)
+      local l1; l1="$(make_link "$LINK_HOST_SAVED" "$PORT_SAVED" "$SNI_SAVED" "xray-reality")"
+      links="$l1"
+      info_blocks="Address      : ${LINK_HOST_SAVED}
+Port         : ${PORT_SAVED}
+SNI / dest   : ${SNI_SAVED} (external)
+
+Share link:
+${l1}" ;;
+    self)
+      local l2; l2="$(make_link "$LINK_HOST_SAVED" "$PORT_SAVED" "$SNI_SAVED" "xray-reality")"
+      links="$l2"
+      info_blocks="Address      : ${LINK_HOST_SAVED}
+Port         : ${PORT_SAVED}
+SNI / dest   : ${SNI_SAVED} (self, local fallback)
+
+Share link:
+${l2}" ;;
+    both)
+      local lb1 lb2
+      lb1="$(make_link "$LINK_HOST_SAVED" "$PORT_SAVED" "$SNI_SAVED" "xray-reality-external")"
+      lb2="$(make_link "$SELF_SNI_SAVED" "$SELF_PORT_SAVED" "$SELF_SNI_SAVED" "xray-reality-self")"
+      links="${lb1}
+${lb2}"
+      info_blocks="[external inbound]
+Address      : ${LINK_HOST_SAVED}
+Port         : ${PORT_SAVED}
+SNI / dest   : ${SNI_SAVED} (external)
+Share link:
+${lb1}
+
+[self inbound]
+Address      : ${SELF_SNI_SAVED}
+Port         : ${SELF_PORT_SAVED}
+SNI / dest   : ${SELF_SNI_SAVED} (self, local fallback)
+Share link:
+${lb2}" ;;
+  esac
   cat > "${CONF_DIR}/client-info.txt" <<EOF
 Xray VLESS + TCP + REALITY + Vision (standalone)
 ================================================
-Address      : ${LINK_HOST_SAVED}
-Port         : ${PORT_SAVED}
+Mode         : ${MODE_SAVED}
 UUID         : ${UUID}
 Flow         : xtls-rprx-vision
 Security     : reality
-SNI          : ${SNI_SAVED}
 Fingerprint  : chrome
 Public key   : ${PUBLIC_KEY}
 Short ID     : ${SHORT_ID}
 minClientVer : ${XRAY_MIN_CLIENT_VER:-(omitted / no version check)}
 
-Share link:
-${link}
+${info_blocks}
 
 Notes:
-- Import the link into v2rayN / v2rayNG (Xray core) as-is.
+- Import the link(s) into v2rayN / v2rayNG (Xray core) as-is.
 - minClientVer default 26.0.0 rejects sing-box based clients (Karing);
   re-run with XRAY_MIN_CLIENT_VER=1.0.0 on the server if you need them.
-- The link contains full credentials. Do not post it publicly.
+- The link(s) contain full credentials. Do not post them publicly.
 EOF
   chmod 600 "${CONF_DIR}/client-info.txt"
   say ""
-  say "================ client link ================"
-  say "$link"
-  say "============================================="
+  say "================ client link(s) ================"
+  say "$links"
+  say "================================================"
   say "Saved to ${CONF_DIR}/client-info.txt (0600)."
 }
 
-smoke_test() { # sni
-  local sni="$1"
+smoke_test() { # port sni
+  local port="$1" sni="$2"
   command -v openssl >/dev/null 2>&1 || { warn "openssl not found, skipping smoke test"; return 0; }
   sleep 2
   local out
-  out="$(echo | openssl s_client -connect "127.0.0.1:${XRAY_PORT}" -servername "$sni" -tls1_3 2>/dev/null | grep -E 'subject=|Protocol' | head -n 3 || true)"
+  out="$(echo | openssl s_client -connect "127.0.0.1:${port}" -servername "$sni" -tls1_3 2>/dev/null | grep -E 'subject=|Protocol' | head -n 3 || true)"
   if printf '%s' "$out" | grep -qi "$sni"; then
-    say "Smoke test OK: unauthenticated handshake returns the dest certificate for ${sni}."
+    say "Smoke test OK (port ${port}): unauthenticated handshake returns the dest certificate for ${sni}."
   else
-    warn "smoke test could not confirm the dest certificate for ${sni} (dest reachability?)."
+    warn "smoke test could not confirm the dest certificate for ${sni} on port ${port} (dest reachability?)."
     warn "Check: journalctl -u ${SERVICE} -n 50"
   fi
 }
@@ -394,54 +462,69 @@ case "${1:-}" in
     [ -n "${UUID:-}" ] || die "no state found at $STATE — run the installer first"
     PORT_SAVED="${PORT:-$XRAY_PORT}"; MODE_SAVED="${MODE:-$XRAY_DEST_MODE}"
     SNI_SAVED="${SNI:-}"; LINK_HOST_SAVED="${LINK_HOST:-}"
+    SELF_PORT_SAVED="${SELF_PORT:-}"; SELF_SNI_SAVED="${SELF_SNI:-}"
     print_link
     exit 0 ;;
 esac
 
 need_root
 valid_port "$XRAY_PORT" || die "invalid XRAY_PORT: $XRAY_PORT"
-[ "$XRAY_DEST_MODE" = "external" ] || [ "$XRAY_DEST_MODE" = "self" ] \
-  || die "XRAY_DEST_MODE must be external or self"
+case "$XRAY_DEST_MODE" in external|self|both) ;; *) die "XRAY_DEST_MODE must be external, self or both";; esac
+if [ "$XRAY_DEST_MODE" = "both" ]; then
+  valid_port "$XRAY_SELF_PORT" || die "invalid XRAY_SELF_PORT: $XRAY_SELF_PORT"
+  [ "$XRAY_SELF_PORT" != "$XRAY_PORT" ] || die "both mode needs XRAY_PORT != XRAY_SELF_PORT"
+fi
 
 # Port occupancy: refuse to stomp on someone else's listener.
-if [ -z "$PREFIX" ] && command -v ss >/dev/null 2>&1; then
-  if ss -tln 2>/dev/null | grep -qE "[:.]${XRAY_PORT}[[:space:]]"; then
-    if ! systemctl is-active --quiet "$SERVICE" 2>/dev/null; then
-      die "port ${XRAY_PORT} is already in use by something else — set XRAY_PORT or free it first"
+check_port_free() {
+  if [ -z "$PREFIX" ] && command -v ss >/dev/null 2>&1; then
+    if ss -tln 2>/dev/null | grep -qE "[:.]$1[[:space:]]"; then
+      if ! systemctl is-active --quiet "$SERVICE" 2>/dev/null; then
+        die "port $1 is already in use by something else — change the port or free it first"
+      fi
     fi
   fi
-fi
+}
+check_port_free "$XRAY_PORT"
+[ "$XRAY_DEST_MODE" = "both" ] && check_port_free "$XRAY_SELF_PORT"
 
 install_xray
 mkdir -p "$CONF_DIR" "$UNIT_DIR"
 
 # ---- resolve mode parameters
-if [ "$XRAY_DEST_MODE" = "self" ]; then
-  [ -n "$XRAY_DOMAIN" ] || die "self mode needs XRAY_DOMAIN=<your domain, DNS pointing to this server>"
+SELF_PORT_SAVED=""; SELF_SNI_SAVED=""
+if [ "$XRAY_DEST_MODE" != "external" ]; then
+  [ -n "$XRAY_DOMAIN" ] || die "self/both mode needs XRAY_DOMAIN=<your domain, DNS pointing to this server>"
   certpair="$(find_cert "$XRAY_DOMAIN")" \
     || die "no certificate found for $XRAY_DOMAIN (checked XRAY_CERT, ~/.acme.sh incl. _ecc, /etc/letsencrypt). Issue one first, e.g. acme.sh --issue -d $XRAY_DOMAIN --standalone"
   CERT_FILE="${certpair%% *}"; KEY_FILE="${certpair##* }"
-  say "Self mode: $XRAY_DOMAIN with cert $CERT_FILE"
+  say "Self inbound: $XRAY_DOMAIN with cert $CERT_FILE"
   # Sanity: DNS should point at this machine (warning only — proxies/VPN mgmt exist).
   dns_ip="$(getent hosts "$XRAY_DOMAIN" 2>/dev/null | awk 'NR==1{print $1}')"
   my_ip="$(public_ipv4)"
   if [ -n "$dns_ip" ] && [ -n "$my_ip" ] && [ "$dns_ip" != "$my_ip" ]; then
     warn "$XRAY_DOMAIN resolves to $dns_ip but this server's public IP looks like $my_ip"
   fi
-  DEST="127.0.0.1:${FALLBACK_PORT}"
-  SNI="$XRAY_DOMAIN"
-  LINK_HOST="${XRAY_ADDR:-$XRAY_DOMAIN}"
-else
-  DEST="${XRAY_DEST_HOST}:443"
-  SNI="$XRAY_DEST_HOST"
-  LINK_HOST="${XRAY_ADDR:-$(public_ipv4)}"
-  [ -n "$LINK_HOST" ] || { LINK_HOST="YOUR_SERVER_IP"; warn "could not auto-detect public IPv4 — replace YOUR_SERVER_IP in the client link, or re-run with XRAY_ADDR=<ip>"; }
 fi
+case "$XRAY_DEST_MODE" in
+  external)
+    SNI="$XRAY_DEST_HOST"
+    LINK_HOST="${XRAY_ADDR:-$(public_ipv4)}" ;;
+  self)
+    SNI="$XRAY_DOMAIN"
+    LINK_HOST="${XRAY_ADDR:-$XRAY_DOMAIN}" ;;
+  both)
+    SNI="$XRAY_DEST_HOST"
+    LINK_HOST="${XRAY_ADDR:-$(public_ipv4)}"
+    SELF_PORT_SAVED="$XRAY_SELF_PORT"; SELF_SNI_SAVED="$XRAY_DOMAIN" ;;
+esac
+[ -n "$LINK_HOST" ] || { LINK_HOST="YOUR_SERVER_IP"; warn "could not auto-detect public IPv4 — replace YOUR_SERVER_IP in the client link, or re-run with XRAY_ADDR=<ip>"; }
 
-# ---- credentials: reuse state when port & mode & sni still match the request
+# ---- credentials: reuse state when ports & mode & snis still match the request
 load_state
 if [ -n "${UUID:-}" ] && [ -n "${PRIVATE_KEY:-}" ] \
-   && [ "${PORT:-}" = "$XRAY_PORT" ] && [ "${MODE:-}" = "$XRAY_DEST_MODE" ] && [ "${SNI:-}" = "$SNI" ]; then
+   && [ "${PORT:-}" = "$XRAY_PORT" ] && [ "${MODE:-}" = "$XRAY_DEST_MODE" ] && [ "${SNI:-}" = "$SNI" ] \
+   && [ "${SELF_PORT:-}" = "$SELF_PORT_SAVED" ] && [ "${SELF_SNI:-}" = "$SELF_SNI_SAVED" ]; then
   say "Reusing existing credentials from state (UUID / keys / shortId unchanged)."
 else
   [ -n "${UUID:-}" ] && say "Parameters changed — generating fresh credentials."
@@ -451,15 +534,15 @@ fi
 PORT_SAVED="$XRAY_PORT"; MODE_SAVED="$XRAY_DEST_MODE"; SNI_SAVED="$SNI"; LINK_HOST_SAVED="$LINK_HOST"
 save_state
 
-if [ "$XRAY_DEST_MODE" = "self" ]; then
+if [ "$XRAY_DEST_MODE" != "external" ]; then
   write_fallback "$CERT_FILE" "$KEY_FILE" "$XRAY_DOMAIN"
 fi
-write_config "$DEST" "$SNI"
+write_config
 write_service
 
 if [ -z "$PREFIX" ]; then
   systemctl daemon-reload
-  [ "$XRAY_DEST_MODE" = "self" ] && systemctl enable --now "$FALLBACK_SERVICE"
+  [ "$XRAY_DEST_MODE" != "external" ] && systemctl enable --now "$FALLBACK_SERVICE"
   systemctl enable --now "$SERVICE"
   systemctl is-active --quiet "$SERVICE" || { journalctl -u "$SERVICE" -n 30 --no-pager; die "service failed to start"; }
   say "Service ${SERVICE} is running."
@@ -468,8 +551,16 @@ else
 fi
 
 if [ -z "$PREFIX" ]; then
-  smoke_test "$SNI"
+  case "$XRAY_DEST_MODE" in
+    external) smoke_test "$XRAY_PORT" "$XRAY_DEST_HOST" ;;
+    self)     smoke_test "$XRAY_PORT" "$XRAY_DOMAIN" ;;
+    both)     smoke_test "$XRAY_PORT" "$XRAY_DEST_HOST"; smoke_test "$XRAY_SELF_PORT" "$XRAY_DOMAIN" ;;
+  esac
 fi
 print_link
 say ""
-say "Done. Firewall/cloud panel: allow TCP ${XRAY_PORT} inbound if this is a fresh box."
+if [ "$XRAY_DEST_MODE" = "both" ]; then
+  say "Done. Firewall/cloud panel: allow TCP ${XRAY_PORT} and TCP ${XRAY_SELF_PORT} inbound if this is a fresh box."
+else
+  say "Done. Firewall/cloud panel: allow TCP ${XRAY_PORT} inbound if this is a fresh box."
+fi
