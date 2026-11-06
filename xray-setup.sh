@@ -16,10 +16,15 @@
 #       self: your own domain (Cloudflare DNS-only / grey cloud is fine).
 #         A local fallback HTTPS site (127.0.0.1:10443, python3) serves your
 #         domain's real certificate; dest = 127.0.0.1:10443, SNI = domain.
-#   - minClientVer defaults to 1.0.0 so sing-box based clients (Karing etc.)
-#     are accepted. Newer Xray servers otherwise reject them by default.
-#     Set XRAY_MIN_CLIENT_VER="" to omit it (strict, Xray-only clients),
-#     or set an explicit version to raise the bar.
+#   - minClientVer defaults to 26.0.0 (strict): only current-generation
+#     Xray-core clients are accepted. sing-box based clients (Karing etc.,
+#     which report an old hardcoded version) are rejected — that is the
+#     point: old-shaped ClientHellos are statistically rarer and easier to
+#     profile. If you still need Karing/sing-box clients, run with
+#     XRAY_MIN_CLIENT_VER=1.0.0 to let them back in (a camouflage tradeoff,
+#     not a crypto one: authentication still requires the REALITY keys).
+#     Note: on Xray 26.10.31, omitting the field entirely enforces nothing,
+#     so strictness has to be an explicit version, not an empty value.
 #
 # Usage:
 #   sudo bash xray-setup.sh                      # external dest mode
@@ -36,7 +41,8 @@
 #   XRAY_CERT/XRAY_KEY explicit cert paths (self mode; else auto-detected)
 #   XRAY_ADDR          host written into the client link (default: domain in
 #                      self mode, else auto-detected public IPv4)
-#   XRAY_MIN_CLIENT_VER default 1.0.0; "" = omit (strict)
+#   XRAY_MIN_CLIENT_VER default 26.0.0 (strict); 1.0.0 = allow sing-box
+#                      clients (Karing); "" = omit the field (no check)
 
 set -u
 
@@ -48,7 +54,7 @@ XRAY_DOMAIN="${XRAY_DOMAIN:-}"
 XRAY_CERT="${XRAY_CERT:-}"
 XRAY_KEY="${XRAY_KEY:-}"
 XRAY_ADDR="${XRAY_ADDR:-}"
-XRAY_MIN_CLIENT_VER="${XRAY_MIN_CLIENT_VER:-1.0.0}"
+XRAY_MIN_CLIENT_VER="${XRAY_MIN_CLIENT_VER:-26.0.0}"
 FALLBACK_PORT=10443
 
 # Testing hooks (not needed on a real VPS):
@@ -336,8 +342,9 @@ Share link:
 ${link}
 
 Notes:
-- Import the link into v2rayN / v2rayNG / Karing as-is.
-- minClientVer default 1.0.0 accepts sing-box based clients (Karing).
+- Import the link into v2rayN / v2rayNG (Xray core) as-is.
+- minClientVer default 26.0.0 rejects sing-box based clients (Karing);
+  re-run with XRAY_MIN_CLIENT_VER=1.0.0 on the server if you need them.
 - The link contains full credentials. Do not post it publicly.
 EOF
   chmod 600 "${CONF_DIR}/client-info.txt"
