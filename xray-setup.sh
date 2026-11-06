@@ -291,10 +291,21 @@ ctx.set_alpn_protocols(["h2", "http/1.1"])
 class H(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *a, **kw):
         super().__init__(*a, directory=root, **kw)
+    def setup(self):
+        # Wrap per-connection INSIDE the worker thread. Wrapping the listening
+        # socket instead would run every TLS handshake serially in the accept
+        # loop: bursts of REALITY handshakes (one per proxied connection) then
+        # stall each other and clients time out intermittently.
+        self.request = ctx.wrap_socket(self.request, server_side=True)
+        super().setup()
     def log_message(self, *a):
         pass
-srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), H)
-srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+class S(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 128
+    def handle_error(self, request, client_address):
+        pass
+srv = S(("127.0.0.1", port), H)
 srv.serve_forever()
 PY
   cat > "${UNIT_DIR}/${FALLBACK_SERVICE}.service" <<EOF

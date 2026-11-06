@@ -2,7 +2,8 @@
 
 只装一个东西：Xray 核心的 VLESS+TCP+REALITY+Vision 入站。独立 systemd 服务 `xray-reality`、独立目录 `/usr/local/etc/xray-reality`，不修改机器上已有的 sing-box / 其他 Xray 安装和它们的配置。
 
-> 版本：v1.3（一步到位：缺证书自动签发——含自动装 acme.sh；缺工具自动 apt 安装；ufw 已启用时自动放行端口）
+> 版本：v1.3.1（回落站并发加固：TLS 握手改为每连接在工作线程内完成 + 监听队列 128，避免广域网高延迟握手在 accept 循环里互相排队）
+> v1.3 起一步到位：缺证书自动签发（含自动装 acme.sh）、缺工具自动 apt 安装、ufw 已启用时自动放行端口。
 > v1.2 新增 both 组合模式：external 与 self 两个入站一次装好。
 > v1.1 起 `minClientVer` 默认为 26.0.0（严格，只收 Xray 内核客户端）；需要放行 sing-box 系客户端（Karing）时用 `XRAY_MIN_CLIENT_VER=1.0.0` 重跑。
 
@@ -43,8 +44,8 @@ sudo XRAY_DEST_MODE=both XRAY_DOMAIN=node.example.com bash xray-setup.sh
 ### 方式二：用离线 zip 包
 
 ```bash
-unzip Xray_Setup_v1.3.zip
-cd Xray_Setup_v1.3
+unzip Xray_Setup_v1.3.1.zip
+cd Xray_Setup_v1.3.1
 sudo bash xray-setup.sh
 ```
 
@@ -81,7 +82,7 @@ sudo bash xray-setup.sh --print-link # 重新打印客户端分享链接
 
 ## 与 v2ray-agent 的区别（为什么另写一个）
 
-- Xray 版本写死 26.10.31，下载后先用官方 .dgst 校验 SHA2-256 再安装，不追滚动 master；脚本本身版本固定、可全文审计（664 行）。
+- Xray 版本写死 26.10.31，下载后先用官方 .dgst 校验 SHA2-256 再安装，不追滚动 master；脚本本身版本固定、可全文审计（675 行）。
 - dest 默认 files.pythonhosted.org（Fastly，不在任何已知脚本默认池），不从域名池里随机抽；shortId 首次运行随机生成，不用全网同款模板值。
 - minClientVer 默认 26.0.0（严格）：只收当前世代的 Xray 内核客户端，sing-box 系客户端（Karing，其握手里报的是老版本）会被拒绝——旧形状的 ClientHello 在现今流量里更扎眼，这正是要拒的。它不是加密防线（准入靠 REALITY 密钥认证），是伪装新鲜度门槛。注意在 Xray 26.10.31 上把该字段留空等于不检查，所以严格必须写显式版本号。
 - UUID / REALITY 密钥 / shortId 首次生成后存盘（state.env，0600），重跑不换，已导入的客户端不会失效。
@@ -129,3 +130,4 @@ sudo bash xray-setup.sh --uninstall   # 卸载（只删本包的服务/配置/�
 - v1.1 复验：脚本生成的严格配置（minClientVer 26.0.0）+ 最新 Xray 客户端（26.10.31）实连通过、经隧道取回数据。
 - v1.2 复验：both 模式生成的双入站配置过 `xray run -test`；两个入站分别用对应客户端实连，均经隧道取回数据；external/self 单模式回归正常、both 重跑复用凭据。
 - v1.3 复验：无证书环境下自动签发全流程跑通（用 acme.sh 替身模拟签发与 install-cert：证书落入配置目录、回落站指向新证书、续期钩子登记成功），该路径实连经隧道取回数据；`XRAY_AUTO_CERT=0` 时恢复为直接报错；external/both 回归正常。（真实 LE 签发需域名解析指向目标机，沙箱无法代验，首次实机签发留意脚本输出。）
+- v1.3.1 复验：回落站新旧实现 A/B 并发测试（60 并发请求 + 20 个垃圾连接混入）本地均 60/60 通过——回环握手太快，复现不了广域网高延迟下旧实现串行握手的排队问题；本版属预防性加固，不是已实锤的故障修复。注：回落站 ALPN 首选 h2（为像真站），用 curl 探活须加 `--http1.1`，直接 curl 会因 h2 帧不匹配返回 000，那是探针假象、不是回落站故障。
