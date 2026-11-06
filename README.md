@@ -2,7 +2,7 @@
 
 只装一个东西：Xray 核心的 VLESS+TCP+REALITY+Vision 入站。独立 systemd 服务 `xray-reality`、独立目录 `/usr/local/etc/xray-reality`，不修改机器上已有的 sing-box / 其他 Xray 安装和它们的配置。
 
-> 版本：v1.3.1（回落站并发加固：TLS 握手改为每连接在工作线程内完成 + 监听队列 128，避免广域网高延迟握手在 accept 循环里互相排队）
+> 版本：v1.4（①新增可选 nginx 回落站：`XRAY_FALLBACK=nginx`，独立实例、原生 HTTP/2、生产级并发；默认仍为零依赖 python 版，选择会记进 state 不用每次带。②新增快捷命令 `xr` + 管理菜单：状态/链接/重启/日志/一键升级/切换回落站/卸载，不开任何新端口）
 > v1.3 起一步到位：缺证书自动签发（含自动装 acme.sh）、缺工具自动 apt 安装、ufw 已启用时自动放行端口。
 > v1.2 新增 both 组合模式：external 与 self 两个入站一次装好。
 > v1.1 起 `minClientVer` 默认为 26.0.0（严格，只收 Xray 内核客户端）；需要放行 sing-box 系客户端（Karing）时用 `XRAY_MIN_CLIENT_VER=1.0.0` 重跑。
@@ -44,8 +44,8 @@ sudo XRAY_DEST_MODE=both XRAY_DOMAIN=node.example.com bash xray-setup.sh
 ### 方式二：用离线 zip 包
 
 ```bash
-unzip Xray_Setup_v1.3.1.zip
-cd Xray_Setup_v1.3.1
+unzip Xray_Setup_v1.4.zip
+cd Xray_Setup_v1.4
 sudo bash xray-setup.sh
 ```
 
@@ -66,7 +66,7 @@ sudo bash xray-setup.sh --print-link # 重新打印客户端分享链接
    sudo bash xray-setup.sh
    ```
 
-2. **self（自己的域名）**：域名解析指向本机（Cloudflare 托管可以，必须灰云“仅 DNS”；开小黄云代理不行）。脚本在本机 127.0.0.1:10443 起一个回落 HTTPS 小站（python3，独立服务 xray-fallback），挂你域名的真证书，REALITY 的 dest 指向它。证书按顺序找：`XRAY_CERT`/`XRAY_KEY` 显式路径 > `~/.acme.sh/<域名>_ecc` > `~/.acme.sh/<域名>` > `/etc/letsencrypt/live/<域名>`；**都找不到就自动签发**（acme.sh + Let's Encrypt standalone，ECC；acme.sh 没装先自动装），不默默退自签。acme.sh 管理的证书还会登记续期钩子：续期后新证书自动落到脚本配置目录并重启回落站，不用管。
+2. **self（自己的域名）**：域名解析指向本机（Cloudflare 托管可以，必须灰云“仅 DNS”；开小黄云代理不行）。脚本在本机 127.0.0.1:10443 起一个回落 HTTPS 小站（默认 python3，可选独立 nginx 实例：`XRAY_FALLBACK=nginx`；独立服务 xray-fallback），挂你域名的真证书，REALITY 的 dest 指向它。证书按顺序找：`XRAY_CERT`/`XRAY_KEY` 显式路径 > `~/.acme.sh/<域名>_ecc` > `~/.acme.sh/<域名>` > `/etc/letsencrypt/live/<域名>`；**都找不到就自动签发**（acme.sh + Let's Encrypt standalone，ECC；acme.sh 没装先自动装），不默默退自签。acme.sh 管理的证书还会登记续期钩子：续期后新证书自动落到脚本配置目录并重启回落站，不用管。
 
    ```bash
    sudo XRAY_DEST_MODE=self XRAY_DOMAIN=node.example.com bash xray-setup.sh
@@ -82,7 +82,7 @@ sudo bash xray-setup.sh --print-link # 重新打印客户端分享链接
 
 ## 与 v2ray-agent 的区别（为什么另写一个）
 
-- Xray 版本写死 26.10.31，下载后先用官方 .dgst 校验 SHA2-256 再安装，不追滚动 master；脚本本身版本固定、可全文审计（675 行）。
+- Xray 版本写死 26.10.31，下载后先用官方 .dgst 校验 SHA2-256 再安装，不追滚动 master；脚本本身版本固定、可全文审计（886 行）。
 - dest 默认 files.pythonhosted.org（Fastly，不在任何已知脚本默认池），不从域名池里随机抽；shortId 首次运行随机生成，不用全网同款模板值。
 - minClientVer 默认 26.0.0（严格）：只收当前世代的 Xray 内核客户端，sing-box 系客户端（Karing，其握手里报的是老版本）会被拒绝——旧形状的 ClientHello 在现今流量里更扎眼，这正是要拒的。它不是加密防线（准入靠 REALITY 密钥认证），是伪装新鲜度门槛。注意在 Xray 26.10.31 上把该字段留空等于不检查，所以严格必须写显式版本号。
 - UUID / REALITY 密钥 / shortId 首次生成后存盘（state.env，0600），重跑不换，已导入的客户端不会失效。
@@ -99,6 +99,7 @@ sudo bash xray-setup.sh --print-link # 重新打印客户端分享链接
 | `XRAY_DEST_HOST` | `files.pythonhosted.org` | external 模式换 dest（须过 TLS1.3 / X25519 / h2） |
 | `XRAY_DEST_MODE` | `external` | `external`、`self` 或 `both` |
 | `XRAY_AUTO_CERT` | `1` | self/both 缺证书时自动签发（含自动装 acme.sh）；`0` = 不签、直接报错 |
+| `XRAY_FALLBACK` | `python` | self/both 回落站实现：`nginx` = 独立 nginx 实例（原生 h2、生产级并发、更像真站）；选择记入 state，重跑可不带 |
 | `XRAY_DOMAIN` | — | self 模式的域名（必填） |
 
 示例：换端口 + 放行 Karing：
@@ -131,3 +132,4 @@ sudo bash xray-setup.sh --uninstall   # 卸载（只删本包的服务/配置/�
 - v1.2 复验：both 模式生成的双入站配置过 `xray run -test`；两个入站分别用对应客户端实连，均经隧道取回数据；external/self 单模式回归正常、both 重跑复用凭据。
 - v1.3 复验：无证书环境下自动签发全流程跑通（用 acme.sh 替身模拟签发与 install-cert：证书落入配置目录、回落站指向新证书、续期钩子登记成功），该路径实连经隧道取回数据；`XRAY_AUTO_CERT=0` 时恢复为直接报错；external/both 回归正常。（真实 LE 签发需域名解析指向目标机，沙箱无法代验，首次实机签发留意脚本输出。）
 - v1.3.1 复验：回落站新旧实现 A/B 并发测试（60 并发请求 + 20 个垃圾连接混入）本地均 60/60 通过——回环握手太快，复现不了广域网高延迟下旧实现串行握手的排队问题；本版属预防性加固，不是已实锤的故障修复。注：回落站 ALPN 首选 h2（为像真站），用 curl 探活须加 `--http1.1`，直接 curl 会因 h2 帧不匹配返回 000，那是探针假象、不是回落站故障。
+- v1.4 复验：nginx 模式 dry-run（self/both）产物正确（独立实例 unit、nginx 1.24 走 `listen ... ssl http2` 分支、state 记录 FALLBACK=nginx）；生成的 nginx 实例实起验证：HTTP/2 与 HTTP/1.1 均 200、60 并发+垃圾连接混入 60/60；`xr` 菜单实测渲染与状态/链接/切换项正常。联调中发现并修复一个真 bug：安装器 umask 077 使 webroot 目录 700、文件 600，nginx 的 nobody worker 读不到会 404——nginx 分支现显式放开目录穿越与 webroot 读权限（state/私钥仍 600）。REALITY 全链路在沙箱只验到“服务端认证通过并发出 egress 拨号”一步：沙箱出口网关会 reset 直连（python 回落站 A/B 同样如此），完整取数未在沙箱复现，以实机为准。

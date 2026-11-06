@@ -61,6 +61,12 @@
 #   XRAY_CERT/XRAY_KEY explicit cert paths (self mode; else auto-detected)
 #   XRAY_AUTO_CERT     1 = auto-issue via acme.sh when no cert is found
 #                      (default 1); 0 = error out instead
+#   XRAY_FALLBACK      python | nginx — fallback site implementation for
+#                      self/both (default python; the choice is remembered
+#                      in state). nginx runs as a dedicated instance under
+#                      the same xray-fallback unit; if the script installs
+#                      nginx itself, it parks the distro nginx service
+#                      (port 80 must stay free for acme.sh renewals).
 #   XRAY_ADDR          host written into the client link (default: domain in
 #                      self mode, else auto-detected public IPv4)
 #   XRAY_MIN_CLIENT_VER default 26.0.0 (strict); 1.0.0 = allow sing-box
@@ -79,6 +85,7 @@ XRAY_KEY="${XRAY_KEY:-}"
 XRAY_AUTO_CERT="${XRAY_AUTO_CERT:-1}"
 XRAY_ADDR="${XRAY_ADDR:-}"
 XRAY_MIN_CLIENT_VER="${XRAY_MIN_CLIENT_VER:-26.0.0}"
+XRAY_FALLBACK="${XRAY_FALLBACK:-}"
 FALLBACK_PORT=10443
 
 # Testing hooks (not needed on a real VPS):
@@ -86,6 +93,9 @@ FALLBACK_PORT=10443
 #   XRAY_BIN          use this xray binary instead of downloading
 PREFIX="${XRAY_ROOT_PREFIX:-}"
 BIN_DIR="${PREFIX}/usr/local/bin"
+SETUP_PATH="${BIN_DIR}/xray-reality-setup"
+SHORTCUT_PATH="${BIN_DIR}/xr"
+RAW_URL="https://raw.githubusercontent.com/signyf/xray-reality-setup/main/xray-setup.sh"
 CONF_DIR="${PREFIX}/usr/local/etc/xray-reality"
 BIN="${XRAY_BIN:-${BIN_DIR}/xray}"
 CONF="${CONF_DIR}/config.json"
@@ -121,6 +131,7 @@ SNI=${SNI_SAVED}
 LINK_HOST=${LINK_HOST_SAVED}
 SELF_PORT=${SELF_PORT_SAVED:-}
 SELF_SNI=${SELF_SNI_SAVED:-}
+FALLBACK=${FALLBACK_KIND:-python}
 EOF
   chmod 600 "$STATE"
 }
@@ -146,7 +157,11 @@ ensure_deps() {
   command -v curl >/dev/null 2>&1 || missing="$missing curl"
   command -v unzip >/dev/null 2>&1 || missing="$missing unzip"
   if [ "$XRAY_DEST_MODE" != "external" ]; then
-    command -v python3 >/dev/null 2>&1 || missing="$missing python3"
+    if [ "$FALLBACK_KIND" = "nginx" ]; then
+      command -v nginx >/dev/null 2>&1 || missing="$missing nginx"
+    else
+      command -v python3 >/dev/null 2>&1 || missing="$missing python3"
+    fi
   fi
   [ -z "$missing" ] && return 0
   [ -n "$PREFIX" ] && die "missing tools:$missing (dry run: install them first)"
@@ -158,6 +173,16 @@ ensure_deps() {
   else
     die "missing tools:$missing — install them first"
   fi
+  case " $missing " in
+    *" nginx "*)
+      # A freshly installed distro nginx auto-starts on :80. We run our own
+      # dedicated instance instead, and acme.sh standalone renewals need :80
+      # free — park the distro service.
+      if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now nginx >/dev/null 2>&1 || true
+        say "Parked the distro nginx service (dedicated fallback instance is used; port 80 stays free for cert renewals)."
+      fi ;;
+  esac
 }
 
 open_firewall() { # port... — only when ufw exists and is active
@@ -271,9 +296,67 @@ issue_cert() { # domain — issue via acme.sh standalone (Let's Encrypt, ECC)
 }
 
 # ------------------------------------------------------------- fallback ----
+nginx_ver() { nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1; }
+ver_ge() { [ -n "$1" ] && [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]; }
+
+write_fallback_nginx() { # cert key domain
+  local cert="$1" key="$2" domain="$3" nbin hver h2line listen_h2=""
+  nbin="$(command -v nginx || true)"
+  [ -n "$nbin" ] || die "XRAY_FALLBACK=nginx but nginx was not found (ensure_deps should have installed it)"
+  mkdir -p "${CONF_DIR}/nginx/logs" "${CONF_DIR}/nginx/tmp"
+  hver="$(nginx_ver)"
+  if ver_ge "$hver" "1.25.1"; then h2line="        http2 on;"; else h2line=""; listen_h2=" http2"; fi
+  cat > "${CONF_DIR}/nginx.conf" <<EOF
+# Dedicated fallback instance for xray-reality — NOT the distro nginx service.
+pid ${CONF_DIR}/nginx/nginx.pid;
+error_log ${CONF_DIR}/nginx/logs/error.log warn;
+worker_processes 1;
+events { worker_connections 256; }
+http {
+    access_log off;
+    types {
+        text/html html htm;
+        text/css css;
+        application/javascript js;
+        image/png png;
+        image/jpeg jpg jpeg;
+        image/gif gif;
+        image/svg+xml svg;
+        image/x-icon ico;
+        font/woff2 woff2;
+    }
+    client_body_temp_path ${CONF_DIR}/nginx/tmp/body;
+    proxy_temp_path ${CONF_DIR}/nginx/tmp/proxy;
+    fastcgi_temp_path ${CONF_DIR}/nginx/tmp/fastcgi;
+    uwsgi_temp_path ${CONF_DIR}/nginx/tmp/uwsgi;
+    scgi_temp_path ${CONF_DIR}/nginx/tmp/scgi;
+    server {
+        listen 127.0.0.1:${FALLBACK_PORT} ssl${listen_h2};
+${h2line}
+        server_name ${domain};
+        ssl_certificate ${cert};
+        ssl_certificate_key ${key};
+        ssl_protocols TLSv1.2 TLSv1.3;
+        root ${CONF_DIR}/webroot;
+        index index.html;
+        location / { try_files \$uri \$uri/ =404; }
+    }
+}
+EOF
+  "$nbin" -t -q -c "${CONF_DIR}/nginx.conf" -p "${CONF_DIR}/nginx" \
+    || die "generated nginx fallback config failed 'nginx -t' — see above"
+  # nginx workers run unprivileged (default nobody): they need traverse on
+  # the config dir and read on the webroot. The installer runs under
+  # umask 077, so without this the site answers 404 (stat permission
+  # denied). Files inside keep their own perms — state.env and the
+  # private key stay 600; only directory traversal + webroot read open up.
+  chmod 755 "$CONF_DIR" "${CONF_DIR}/webroot" "${CONF_DIR}/nginx" "${CONF_DIR}/nginx/logs" "${CONF_DIR}/nginx/tmp"
+  [ -f "${CONF_DIR}/webroot/index.html" ] && chmod 644 "${CONF_DIR}/webroot/index.html"
+  FB_EXEC="${nbin} -c ${CONF_DIR}/nginx.conf -p ${CONF_DIR}/nginx -g \"daemon off;\""
+}
+
 write_fallback() { # cert key domain
   local cert="$1" key="$2" domain="$3"
-  command -v python3 >/dev/null 2>&1 || die "self mode needs python3 for the local fallback HTTPS site"
   mkdir -p "${CONF_DIR}/webroot"
   if [ ! -f "${CONF_DIR}/webroot/index.html" ]; then
     cat > "${CONF_DIR}/webroot/index.html" <<HTML
@@ -282,7 +365,13 @@ write_fallback() { # cert key domain
 <body><h1>Welcome to ${domain}</h1><p>This site is under construction.</p></body></html>
 HTML
   fi
-  cat > "${CONF_DIR}/fallback.py" <<'PY'
+  if [ "$FALLBACK_KIND" = "nginx" ]; then
+    write_fallback_nginx "$cert" "$key" "$domain"
+    say "Fallback site: dedicated nginx instance (config ${CONF_DIR}/nginx.conf)."
+  else
+    command -v python3 >/dev/null 2>&1 || die "self mode needs python3 for the local fallback HTTPS site"
+    FB_EXEC="/usr/bin/env python3 ${CONF_DIR}/fallback.py ${cert} ${key} ${CONF_DIR}/webroot ${FALLBACK_PORT}"
+    cat > "${CONF_DIR}/fallback.py" <<'PY'
 import ssl, sys, http.server, threading
 cert, key, root, port = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -308,6 +397,7 @@ class S(http.server.ThreadingHTTPServer):
 srv = S(("127.0.0.1", port), H)
 srv.serve_forever()
 PY
+  fi
   cat > "${UNIT_DIR}/${FALLBACK_SERVICE}.service" <<EOF
 [Unit]
 Description=Xray REALITY fallback HTTPS site (self dest mode)
@@ -315,7 +405,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/env python3 ${CONF_DIR}/fallback.py ${cert} ${key} ${CONF_DIR}/webroot ${FALLBACK_PORT}
+ExecStart=${FB_EXEC}
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=true
@@ -323,7 +413,7 @@ NoNewPrivileges=true
 [Install]
 WantedBy=multi-user.target
 EOF
-  say "Fallback site unit written (${FALLBACK_SERVICE}, 127.0.0.1:${FALLBACK_PORT})."
+  say "Fallback site unit written (${FALLBACK_SERVICE}, 127.0.0.1:${FALLBACK_PORT}, impl: ${FALLBACK_KIND})."
 }
 
 # --------------------------------------------------------------- config ----
@@ -518,6 +608,118 @@ smoke_test() { # port sni
   fi
 }
 
+# ------------------------------------------------------ shortcut / menu ----
+install_shortcut() {
+  # Install a stable copy of this script plus the `xr` shortcut command
+  # (v2ray-agent's vasma pattern). cp+mv so re-running from the installed
+  # copy replaces it atomically — bash keeps executing the old inode.
+  mkdir -p "$BIN_DIR"
+  if [ -f "${0:-}" ]; then
+    cp -f "$0" "${SETUP_PATH}.new" && chmod 755 "${SETUP_PATH}.new" \
+      && mv -f "${SETUP_PATH}.new" "$SETUP_PATH" \
+      || warn "could not install the management copy at ${SETUP_PATH}"
+  fi
+  if cat > "$SHORTCUT_PATH" <<EOF
+#!/usr/bin/env bash
+exec bash "${SETUP_PATH}" --menu "\$@"
+EOF
+  then
+    chmod 755 "$SHORTCUT_PATH"
+    say "Management shortcut installed: run 'xr' anytime for the menu."
+  else
+    warn "could not write the shortcut command at ${SHORTCUT_PATH}"
+  fi
+}
+
+prep_print_vars() {
+  PORT_SAVED="${PORT:-$XRAY_PORT}"; MODE_SAVED="${MODE:-$XRAY_DEST_MODE}"
+  SNI_SAVED="${SNI:-}"; LINK_HOST_SAVED="${LINK_HOST:-}"
+  SELF_PORT_SAVED="${SELF_PORT:-}"; SELF_SNI_SAVED="${SELF_SNI:-}"
+}
+
+state_env_args() {
+  # Print env assignments that reproduce the recorded install (for menu
+  # actions that re-run the installer: upgrade, fallback switch).
+  printf 'XRAY_DEST_MODE=%s\n' "${MODE:-external}"
+  printf 'XRAY_PORT=%s\n' "${PORT:-443}"
+  case "${MODE:-}" in
+    self|both)
+      printf 'XRAY_DOMAIN=%s\n' "${SNI:-}"
+      printf 'XRAY_FALLBACK=%s\n' "${FALLBACK:-python}"
+      [ "${MODE:-}" = "both" ] && printf 'XRAY_SELF_PORT=%s\n' "${SELF_PORT:-8443}"
+      ;;
+  esac
+}
+
+menu_rerun() { # extra-env... — replace this process with a fresh install run
+  local self="$0"
+  [ -f "$SETUP_PATH" ] && self="$SETUP_PATH"
+  local assignments=()
+  mapfile -t assignments < <(state_env_args)
+  exec env "${assignments[@]}" "$@" bash "$self"
+}
+
+menu_status() {
+  local st
+  say "-- services --"
+  st="$(systemctl is-active "$SERVICE" 2>/dev/null)"; say "xray-reality : ${st:-unknown}"
+  if [ "${MODE:-}" != "external" ] && [ -n "${MODE:-}" ]; then
+    st="$(systemctl is-active "$FALLBACK_SERVICE" 2>/dev/null)"; say "xray-fallback: ${st:-unknown} (impl: ${FALLBACK:-python})"
+  fi
+  say "-- listeners --"
+  ss -tlnp 2>/dev/null | grep -E ":(${PORT:-443}|${SELF_PORT:-8443}|10443)[[:space:]]" || say "(none matched)"
+  if [ -f "${CONF_DIR}/fullchain.pem" ] && command -v openssl >/dev/null 2>&1; then
+    say "cert expires: $(openssl x509 -enddate -noout -in "${CONF_DIR}/fullchain.pem" 2>/dev/null | cut -d= -f2)"
+  fi
+}
+
+show_menu() {
+  need_root
+  load_state
+  [ -n "${UUID:-}" ] || die "no install found at $CONF_DIR — run the installer first"
+  local choice other
+  while true; do
+    say ""
+    say "===== xray-reality menu ====="
+    say "mode: ${MODE:-?}   port: ${PORT:-?}   fallback: ${FALLBACK:-python}"
+    say "  1) status"
+    say "  2) show client link"
+    say "  3) restart services"
+    say "  4) recent logs"
+    say "  5) upgrade script (download latest, re-run, credentials kept)"
+    if [ "${MODE:-}" = "self" ] || [ "${MODE:-}" = "both" ]; then
+      other="nginx"; [ "${FALLBACK:-python}" = "nginx" ] && other="python"
+      say "  6) switch fallback to ${other}"
+    fi
+    say "  7) uninstall"
+    say "  0) exit"
+    printf 'choice: '
+    read -r choice || return 0
+    case "$choice" in
+      1) menu_status ;;
+      2) prep_print_vars; print_link ;;
+      3) systemctl restart "$FALLBACK_SERVICE" 2>/dev/null || true
+         systemctl restart "$SERVICE" && say "restarted." ;;
+      4) journalctl -u "$SERVICE" -n 25 --no-pager 2>/dev/null || say "journalctl unavailable" ;;
+      5) say "Downloading latest script..."
+         if curl -fsSL --retry 3 "$RAW_URL" -o "${SETUP_PATH}.new"; then
+           chmod 755 "${SETUP_PATH}.new" && mv -f "${SETUP_PATH}.new" "$SETUP_PATH"
+           say "Upgrading (re-running the new version with your saved settings)..."
+           menu_rerun
+         else
+           say "download failed — staying on the current version."
+         fi ;;
+      6) [ "${MODE:-}" = "self" ] || [ "${MODE:-}" = "both" ] || { say "external mode has no fallback."; continue; }
+         say "Re-running with XRAY_FALLBACK=${other}..."
+         menu_rerun "XRAY_FALLBACK=${other}" ;;
+      7) printf 'uninstall everything? [y/N] '; read -r yn || yn=""
+         case "$yn" in y|Y) do_uninstall ;; *) say "cancelled." ;; esac ;;
+      0) return 0 ;;
+      *) say "invalid choice" ;;
+    esac
+  done
+}
+
 # ------------------------------------------------------------ uninstall ----
 do_uninstall() {
   need_root
@@ -525,6 +727,7 @@ do_uninstall() {
     systemctl disable --now "$SERVICE" 2>/dev/null || true
     systemctl disable --now "$FALLBACK_SERVICE" 2>/dev/null || true
   fi
+  rm -f "$SHORTCUT_PATH" "$SETUP_PATH"
   rm -f "${UNIT_DIR}/${SERVICE}.service" "${UNIT_DIR}/${FALLBACK_SERVICE}.service"
   rm -rf "${UNIT_DIR}/${SERVICE}.service.d"
   rm -rf "$CONF_DIR"
@@ -538,12 +741,11 @@ do_uninstall() {
 # ----------------------------------------------------------------- main ----
 case "${1:-}" in
   --uninstall) do_uninstall ;;
+  --menu) show_menu; exit 0 ;;
   --print-link)
     load_state
     [ -n "${UUID:-}" ] || die "no state found at $STATE — run the installer first"
-    PORT_SAVED="${PORT:-$XRAY_PORT}"; MODE_SAVED="${MODE:-$XRAY_DEST_MODE}"
-    SNI_SAVED="${SNI:-}"; LINK_HOST_SAVED="${LINK_HOST:-}"
-    SELF_PORT_SAVED="${SELF_PORT:-}"; SELF_SNI_SAVED="${SELF_SNI:-}"
+    prep_print_vars
     print_link
     exit 0 ;;
 esac
@@ -551,6 +753,14 @@ esac
 need_root
 valid_port "$XRAY_PORT" || die "invalid XRAY_PORT: $XRAY_PORT"
 case "$XRAY_DEST_MODE" in external|self|both) ;; *) die "XRAY_DEST_MODE must be external, self or both";; esac
+# Fallback implementation for self/both: env wins; otherwise whatever the
+# previous run recorded in state; otherwise python.
+FALLBACK_KIND="$XRAY_FALLBACK"
+if [ -z "$FALLBACK_KIND" ] && [ -f "$STATE" ]; then
+  FALLBACK_KIND="$( ( . "$STATE" ) >/dev/null 2>&1; printf '%s' "${FALLBACK:-python}" )"
+fi
+FALLBACK_KIND="${FALLBACK_KIND:-python}"
+case "$FALLBACK_KIND" in python|nginx) ;; *) die "XRAY_FALLBACK must be 'python' or 'nginx'";; esac
 if [ "$XRAY_DEST_MODE" = "both" ]; then
   valid_port "$XRAY_SELF_PORT" || die "invalid XRAY_SELF_PORT: $XRAY_SELF_PORT"
   [ "$XRAY_SELF_PORT" != "$XRAY_PORT" ] || die "both mode needs XRAY_PORT != XRAY_SELF_PORT"
@@ -667,6 +877,7 @@ if [ -z "$PREFIX" ]; then
   esac
 fi
 print_link
+install_shortcut
 say ""
 if [ "$XRAY_DEST_MODE" = "both" ]; then
   say "Done. Firewall/cloud panel: allow TCP ${XRAY_PORT} and TCP ${XRAY_SELF_PORT} inbound if this is a fresh box."
