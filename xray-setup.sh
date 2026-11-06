@@ -21,6 +21,18 @@
 #         sharing one UUID / keypair / shortId; two client links are printed.
 #         (One REALITY inbound carries exactly one dest, so "combined" means
 #         two inbounds side by side, like v2ray-agent's combined install.)
+#   - Certificate handling (self/both): existing certs are auto-detected
+#     (XRAY_CERT/XRAY_KEY, ~/.acme.sh incl. _ecc, /etc/letsencrypt). If none
+#     is found, one is issued automatically (Let's Encrypt, standalone
+#     HTTP-01, ECC) — including installing acme.sh itself first when it is
+#     missing. Disable all of that with XRAY_AUTO_CERT=0. For acme.sh-managed
+#     certs the script also registers --install-cert into its own config dir
+#     with a reload hook, so renewals land in place and restart the fallback
+#     site automatically.
+#   - One-shot like v2ray-agent: missing tools (curl/unzip/python3) are
+#     installed via apt-get when possible, and if ufw is active the listen
+#     port(s) are allowed through it. Cloud-panel security groups are the
+#     one thing no script can open for you.
 #   - minClientVer defaults to 26.0.0 (strict): only current-generation
 #     Xray-core clients are accepted. sing-box based clients (Karing etc.,
 #     which report an old hardcoded version) are rejected — that is the
@@ -47,6 +59,8 @@
 #   XRAY_DEST_HOST     external dest host         (default files.pythonhosted.org)
 #   XRAY_DOMAIN        your domain (self mode, required there)
 #   XRAY_CERT/XRAY_KEY explicit cert paths (self mode; else auto-detected)
+#   XRAY_AUTO_CERT     1 = auto-issue via acme.sh when no cert is found
+#                      (default 1); 0 = error out instead
 #   XRAY_ADDR          host written into the client link (default: domain in
 #                      self mode, else auto-detected public IPv4)
 #   XRAY_MIN_CLIENT_VER default 26.0.0 (strict); 1.0.0 = allow sing-box
@@ -62,6 +76,7 @@ XRAY_DEST_HOST="${XRAY_DEST_HOST:-files.pythonhosted.org}"
 XRAY_DOMAIN="${XRAY_DOMAIN:-}"
 XRAY_CERT="${XRAY_CERT:-}"
 XRAY_KEY="${XRAY_KEY:-}"
+XRAY_AUTO_CERT="${XRAY_AUTO_CERT:-1}"
 XRAY_ADDR="${XRAY_ADDR:-}"
 XRAY_MIN_CLIENT_VER="${XRAY_MIN_CLIENT_VER:-26.0.0}"
 FALLBACK_PORT=10443
@@ -123,6 +138,36 @@ gen_credentials() {
   else
     SHORT_ID="$(od -An -tx1 -N8 /dev/urandom | tr -d ' \n')"
   fi
+}
+
+# ---------------------------------------------------------------- deps -----
+ensure_deps() {
+  local missing=""
+  command -v curl >/dev/null 2>&1 || missing="$missing curl"
+  command -v unzip >/dev/null 2>&1 || missing="$missing unzip"
+  if [ "$XRAY_DEST_MODE" != "external" ]; then
+    command -v python3 >/dev/null 2>&1 || missing="$missing python3"
+  fi
+  [ -z "$missing" ] && return 0
+  [ -n "$PREFIX" ] && die "missing tools:$missing (dry run: install them first)"
+  if command -v apt-get >/dev/null 2>&1; then
+    say "Installing missing tools:$missing"
+    apt-get install -y $missing >/dev/null 2>&1 \
+      || { apt-get update -qq && apt-get install -y $missing >/dev/null 2>&1; } \
+      || die "failed to install:$missing"
+  else
+    die "missing tools:$missing — install them first"
+  fi
+}
+
+open_firewall() { # port... — only when ufw exists and is active
+  [ -n "$PREFIX" ] && return 0
+  command -v ufw >/dev/null 2>&1 || return 0
+  ufw status 2>/dev/null | grep -qi '^Status: active' || return 0
+  local p
+  for p in "$@"; do
+    ufw allow "${p}/tcp" >/dev/null 2>&1 && say "ufw: allowed ${p}/tcp (it was active)."
+  done
 }
 
 # ------------------------------------------------------------- download ----
@@ -198,6 +243,31 @@ find_cert() { # domain -> echoes "cert key" or nothing
     fi
   done
   return 1
+}
+
+install_acme() { # installs acme.sh (official installer) if missing
+  local acme="${HOME:-/root}/.acme.sh/acme.sh" tmp
+  [ -x "$acme" ] && return 0
+  say "acme.sh not found — installing it (official installer from get.acme.sh)..."
+  tmp="$(mktemp -d)"
+  if ! curl -fsSL https://get.acme.sh -o "${tmp}/acme-install.sh"; then
+    rm -rf "$tmp"; warn "cannot download the acme.sh installer"; return 1
+  fi
+  ( cd "$tmp" && sh acme-install.sh >/dev/null 2>&1 ) || { rm -rf "$tmp"; warn "acme.sh installer failed"; return 1; }
+  rm -rf "$tmp"
+  [ -x "$acme" ] || { warn "acme.sh still missing after install"; return 1; }
+  say "acme.sh installed."
+}
+
+issue_cert() { # domain — issue via acme.sh standalone (Let's Encrypt, ECC)
+  local acme="${HOME:-/root}/.acme.sh/acme.sh"
+  install_acme || { warn "cannot auto-issue without acme.sh"; return 1; }
+  if command -v ss >/dev/null 2>&1 && ss -tln 2>/dev/null | grep -qE '[:.]80[[:space:]]'; then
+    warn "port 80 is already in use — acme.sh standalone needs it for the HTTP-01 challenge"
+    return 1
+  fi
+  say "No certificate found for $1 — issuing one with acme.sh (Let's Encrypt, standalone)..."
+  "$acme" --issue -d "$1" --standalone --server letsencrypt --keylength ec-256
 }
 
 # ------------------------------------------------------------- fallback ----
@@ -488,6 +558,7 @@ check_port_free() {
 check_port_free "$XRAY_PORT"
 [ "$XRAY_DEST_MODE" = "both" ] && check_port_free "$XRAY_SELF_PORT"
 
+ensure_deps
 install_xray
 mkdir -p "$CONF_DIR" "$UNIT_DIR"
 
@@ -495,9 +566,31 @@ mkdir -p "$CONF_DIR" "$UNIT_DIR"
 SELF_PORT_SAVED=""; SELF_SNI_SAVED=""
 if [ "$XRAY_DEST_MODE" != "external" ]; then
   [ -n "$XRAY_DOMAIN" ] || die "self/both mode needs XRAY_DOMAIN=<your domain, DNS pointing to this server>"
-  certpair="$(find_cert "$XRAY_DOMAIN")" \
-    || die "no certificate found for $XRAY_DOMAIN (checked XRAY_CERT, ~/.acme.sh incl. _ecc, /etc/letsencrypt). Issue one first, e.g. acme.sh --issue -d $XRAY_DOMAIN --standalone"
+  CERT_SRC=""
+  if certpair="$(find_cert "$XRAY_DOMAIN")"; then
+    :
+  elif [ "$XRAY_AUTO_CERT" = "1" ] && issue_cert "$XRAY_DOMAIN" && certpair="$(find_cert "$XRAY_DOMAIN")"; then
+    say "Certificate issued for $XRAY_DOMAIN."
+  else
+    die "no certificate found for $XRAY_DOMAIN (checked XRAY_CERT, ~/.acme.sh incl. _ecc, /etc/letsencrypt) and auto-issue is unavailable or failed. Issue one manually, e.g. acme.sh --issue -d $XRAY_DOMAIN --standalone, or pass XRAY_CERT/XRAY_KEY."
+  fi
   CERT_FILE="${certpair%% *}"; KEY_FILE="${certpair##* }"
+  case "$CERT_FILE" in "${HOME:-/root}/.acme.sh/"*) CERT_SRC="acme";; esac
+  if [ "$CERT_SRC" = "acme" ]; then
+    # Copy the acme.sh-managed cert into our own dir and register a reload
+    # hook, so automatic renewals land here and restart the fallback site.
+    local_ecc=""
+    case "$CERT_FILE" in *"_ecc/"*) local_ecc="--ecc";; esac
+    mkdir -p "$CONF_DIR"
+    if "${HOME:-/root}/.acme.sh/acme.sh" --install-cert -d "$XRAY_DOMAIN" $local_ecc \
+         --fullchain-file "${CONF_DIR}/fullchain.pem" --key-file "${CONF_DIR}/privkey.pem" \
+         --reloadcmd "systemctl restart ${FALLBACK_SERVICE}" >/dev/null 2>&1; then
+      CERT_FILE="${CONF_DIR}/fullchain.pem"; KEY_FILE="${CONF_DIR}/privkey.pem"
+      say "acme.sh renewal hook registered (renewed cert -> ${CONF_DIR}, restarts ${FALLBACK_SERVICE})."
+    else
+      warn "acme.sh --install-cert failed; using the cert in place — renewals will need a manual ${FALLBACK_SERVICE} restart."
+    fi
+  fi
   say "Self inbound: $XRAY_DOMAIN with cert $CERT_FILE"
   # Sanity: DNS should point at this machine (warning only — proxies/VPN mgmt exist).
   dns_ip="$(getent hosts "$XRAY_DOMAIN" 2>/dev/null | awk 'NR==1{print $1}')"
@@ -546,6 +639,11 @@ if [ -z "$PREFIX" ]; then
   systemctl enable --now "$SERVICE"
   systemctl is-active --quiet "$SERVICE" || { journalctl -u "$SERVICE" -n 30 --no-pager; die "service failed to start"; }
   say "Service ${SERVICE} is running."
+  if [ "$XRAY_DEST_MODE" = "both" ]; then
+    open_firewall "$XRAY_PORT" "$XRAY_SELF_PORT"
+  else
+    open_firewall "$XRAY_PORT"
+  fi
 else
   say "Dry local run (prefix set): systemd steps skipped."
 fi
