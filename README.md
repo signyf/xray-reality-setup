@@ -1,6 +1,8 @@
-Xray_Setup v1.1 — Xray VLESS + TCP + REALITY + Vision 独立安装脚本
+Xray_Setup v1.1.1 — Xray VLESS + TCP + REALITY + Vision 独立安装脚本
 ================================================================
 
+v1.1.1 变更（2026-11-06）：仅补文档——新增下面的「安装命令」一节，
+脚本本体与 v1.1 逐字节一致。
 v1.1 变更（2026-11-06）：minClientVer 默认值从 1.0.0 改为 26.0.0（严格）。
 客户端统一用最新 Xray 内核的前提下，不再为 sing-box 系客户端（Karing）
 放宽验收线。需要 Karing 时仍可 XRAY_MIN_CLIENT_VER=1.0.0 重跑放行。
@@ -10,6 +12,36 @@ v1.1 变更（2026-11-06）：minClientVer 默认值从 1.0.0 改为 26.0.0（�
 只装一个东西：Xray 核心的 VLESS+TCP+REALITY+Vision 入站。
 独立 systemd 服务 xray-reality、独立目录 /usr/local/etc/xray-reality，
 不修改机器上已有的 sing-box / 其他 Xray 安装和它们的配置。
+
+安装命令
+--------
+前置要求：root 权限；Debian/Ubuntu 等带 systemd 的 Linux；能直连
+GitHub（脚本要下载 Xray 官方包并验哈希）；云面板/防火墙放行要用的
+TCP 端口（默认 443）。self 模式另需：域名 A 记录已指向本机（CF 灰云
+仅 DNS）、域名证书已签发在本机、python3 可用。
+
+方式一：从 GitHub 下载（推荐，版本与仓库一致）
+
+  curl -fsSLO https://raw.githubusercontent.com/signyf/xray-reality-setup/main/xray-setup.sh
+  less xray-setup.sh        # 先审后跑，不要管道直接执行
+
+  # 默认 external 模式（dest = files.pythonhosted.org）
+  sudo bash xray-setup.sh
+
+  # self 模式（自己的域名当 SNI/dest）
+  sudo XRAY_DEST_MODE=self XRAY_DOMAIN=node.example.com bash xray-setup.sh
+
+方式二：用离线 zip 包
+
+  unzip Xray_Setup_v1.1.1.zip
+  cd Xray_Setup_v1.1.1
+  sudo bash xray-setup.sh
+
+装完验证与取链接：
+
+  systemctl status xray-reality          # 应为 active (running)
+  sudo bash xray-setup.sh --print-link   # 重新打印客户端分享链接
+  # 或直接看 /usr/local/etc/xray-reality/client-info.txt
 
 与 v2ray-agent 的区别（为什么另写一个）
 --------------------------------------
