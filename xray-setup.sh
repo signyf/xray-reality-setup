@@ -336,7 +336,7 @@ SNI          : ${SNI_SAVED}
 Fingerprint  : chrome
 Public key   : ${PUBLIC_KEY}
 Short ID     : ${SHORT_ID}
-minClientVer : ${XRAY_MIN_CLIENT_VER:-(omitted / strict)}
+minClientVer : ${XRAY_MIN_CLIENT_VER:-(omitted / no version check)}
 
 Share link:
 ${link}
