@@ -2,7 +2,8 @@
 
 只装一个东西：Xray 核心的 VLESS+TCP+REALITY+Vision 入站。独立 systemd 服务 `xray-reality`、独立目录 `/usr/local/etc/xray-reality`，不修改机器上已有的 sing-box / 其他 Xray 安装和它们的配置。
 
-> 版本：v1.6（新增可选 Hysteria2 入站 `XRAY_HY2=on`：与 VLESS 同一个 Xray 进程、官方 finalmask 方案，详见下文专节；`xr` 菜单第 8 项可开关）
+> 版本：v1.6.1（修一个重跑坑：旧版用 `systemctl enable --now`，对**已在运行**的服务不重启——重跑后新配置只落在磁盘上、进程还跑旧配置（实测症状：Hy2 配置已写入、服务显示 active、但 UDP 根本没监听、客户端全是 -1）。v1.6.1 起重跑显式 restart，并加了 Hy2 UDP 监听自检）
+> v1.6：新增可选 Hysteria2 入站 `XRAY_HY2=on`：与 VLESS 同一个 Xray 进程、官方 finalmask 方案，详见下文专节；`xr` 菜单第 8 项可开关。
 > v1.5：Xray 核心可自助升级：`xr` 菜单第 6 项或 `XRAY_VERSION=latest` 直接查 GitHub 最新版并升级，官方哈希照常校验；装过的核心版本记入 state，重跑永不静默降级。另修复 v1.4 的 state 读回 bug——回落站选择此前实际记不住，v1.5 起真正生效。
 > v1.4 起：可选 nginx 回落站（`XRAY_FALLBACK=nginx`）+ 快捷命令 `xr` 管理菜单。
 > v1.3 起一步到位：缺证书自动签发（含自动装 acme.sh）、缺工具自动 apt 安装、ufw 已启用时自动放行端口。
@@ -46,8 +47,8 @@ sudo XRAY_DEST_MODE=both XRAY_DOMAIN=node.example.com bash xray-setup.sh
 ### 方式二：用离线 zip 包
 
 ```bash
-unzip Xray_Setup_v1.6.zip
-cd Xray_Setup_v1.6
+unzip Xray_Setup_v1.6.1.zip
+cd Xray_Setup_v1.6.1
 sudo bash xray-setup.sh
 ```
 

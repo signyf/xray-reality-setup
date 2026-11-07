@@ -47,7 +47,9 @@
 #     "hysteria" (version 2) over QUIC/TLS, Salamander obfuscation via
 #     finalmask (the official replacement for the old in-protocol obfs),
 #     plus an HTTP/3 masquerade proxy. Auth + obfs passwords are generated
-#     once and kept in state. Certificate: the install's domain cert when
+#     once and kept in state. (v1.6.1: re-runs restart the service
+#     explicitly — `systemctl enable --now` does not restart a running
+#     unit, which once left a stale pre-Hy2 config serving in memory.) Certificate: the install's domain cert when
 #     one exists (self/both, or XRAY_DOMAIN given), else a self-signed
 #     cert (SNI www.bing.com) whose link carries pinSHA256. Needs core
 #     >= 26.3.27. NOTE for Xray 26.x raw-JSON configs: allowInsecure was
@@ -1108,10 +1110,23 @@ write_service
 
 if [ -z "$PREFIX" ]; then
   systemctl daemon-reload
-  [ "$XRAY_DEST_MODE" != "external" ] && systemctl enable --now "$FALLBACK_SERVICE"
-  systemctl enable --now "$SERVICE"
+  # `enable --now` does NOT restart an already-running unit: on a re-run the
+  # old process would keep serving the OLD config from memory (v1.6.1 fix —
+  # this bit for real: Hy2 config written to disk, service "active", but no
+  # UDP listener and every client at -1). Always restart explicitly.
+  if [ "$XRAY_DEST_MODE" != "external" ]; then
+    systemctl enable "$FALLBACK_SERVICE" >/dev/null 2>&1 || true
+    systemctl restart "$FALLBACK_SERVICE"
+  fi
+  systemctl enable "$SERVICE" >/dev/null 2>&1 || true
+  systemctl restart "$SERVICE"
   systemctl is-active --quiet "$SERVICE" || { journalctl -u "$SERVICE" -n 30 --no-pager; die "service failed to start"; }
   say "Service ${SERVICE} is running."
+  if [ "$HY2_ON" = "1" ] && command -v ss >/dev/null 2>&1; then
+    sleep 1
+    ss -uln 2>/dev/null | grep -qE "[:.]${XRAY_HY2_PORT}[[:space:]]" \
+      || warn "Hy2 is enabled but nothing is listening on UDP ${XRAY_HY2_PORT} — check: journalctl -u ${SERVICE} -n 30"
+  fi
   fw_args=("${XRAY_PORT}/tcp")
   [ "$XRAY_DEST_MODE" = "both" ] && fw_args+=("${XRAY_SELF_PORT}/tcp")
   [ "$HY2_ON" = "1" ] && fw_args+=("${XRAY_HY2_PORT}/udp")
