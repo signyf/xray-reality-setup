@@ -2,7 +2,8 @@
 
 只装一个东西：Xray 核心的 VLESS+TCP+REALITY+Vision 入站。独立 systemd 服务 `xray-reality`、独立目录 `/usr/local/etc/xray-reality`，不修改机器上已有的 sing-box / 其他 Xray 安装和它们的配置。
 
-> 版本：v1.5（Xray 核心可自助升级：`xr` 菜单第 6 项或 `XRAY_VERSION=latest` 直接查 GitHub 最新版并升级，官方哈希照常校验；装过的核心版本记入 state，重跑永不静默降级。另修复 v1.4 的 state 读回 bug——回落站选择此前实际记不住，v1.5 起真正生效）
+> 版本：v1.6（新增可选 Hysteria2 入站 `XRAY_HY2=on`：与 VLESS 同一个 Xray 进程、官方 finalmask 方案，详见下文专节；`xr` 菜单第 8 项可开关）
+> v1.5：Xray 核心可自助升级：`xr` 菜单第 6 项或 `XRAY_VERSION=latest` 直接查 GitHub 最新版并升级，官方哈希照常校验；装过的核心版本记入 state，重跑永不静默降级。另修复 v1.4 的 state 读回 bug——回落站选择此前实际记不住，v1.5 起真正生效。
 > v1.4 起：可选 nginx 回落站（`XRAY_FALLBACK=nginx`）+ 快捷命令 `xr` 管理菜单。
 > v1.3 起一步到位：缺证书自动签发（含自动装 acme.sh）、缺工具自动 apt 安装、ufw 已启用时自动放行端口。
 > v1.2 新增 both 组合模式：external 与 self 两个入站一次装好。
@@ -45,8 +46,8 @@ sudo XRAY_DEST_MODE=both XRAY_DOMAIN=node.example.com bash xray-setup.sh
 ### 方式二：用离线 zip 包
 
 ```bash
-unzip Xray_Setup_v1.5.zip
-cd Xray_Setup_v1.5
+unzip Xray_Setup_v1.6.zip
+cd Xray_Setup_v1.6
 sudo bash xray-setup.sh
 ```
 
@@ -81,10 +82,24 @@ sudo bash xray-setup.sh --print-link # 重新打印客户端分享链接
    sudo XRAY_DEST_MODE=both XRAY_DOMAIN=node.example.com bash xray-setup.sh
    ```
 
+## Hysteria2 入站（可选，v1.6 起）
+
+```bash
+sudo XRAY_HY2=on bash xray-setup.sh        # 任意 dest 模式都可叠加
+```
+
+- 与 VLESS 装在**同一个 Xray 进程**里（同一个服务、同一份配置多一个入站），用的是 Xray 官方的 Hy2 方案，不是另起 sing-box：协议 `hysteria`（version 2）、QUIC/TLS 传输、**Salamander 混淆走官方 `finalmask`**（旧式协议内 obfs 的官方替代）、外加 HTTP/3 masquerade 伪装代理（探测者会被反代到 bing）。
+- 默认 UDP **8443**（`XRAY_HY2_PORT` 可改）。**与 sing-box 的 Hy2 不能共用同一个 UDP 端口**——机器上已有 sing-box-hy2 占着 8443 时，要么给 Xray 的 Hy2 换端口，要么先退掉 sing-box 那个；脚本检测到 UDP 端口被别人占用会直接报错说明。
+- 证书按优先级：`XRAY_HY2_CERT`/`XRAY_HY2_KEY` 显式指定 > 本机域名证书（self/both 模式现成的，或 external 模式下显式给 `XRAY_DOMAIN`，同样自动查找/签发） > 自动生成的自签证书（SNI 默认 www.bing.com）。auth 与 obfs 密码首次生成后存 state，重跑不换；关掉再开（`XRAY_HY2=off` 重跑，或 `xr` 菜单第 8 项）密码也保留，旧链接继续有效。
+- 客户端链接：域名证书模式不带 pin（证书会续期，钉死会断）；自签/自备证书模式带 `pinSHA256`（叶子证书 DER 的 SHA-256）。客户端须用 **Xray 内核**（v2rayN / v2rayNG）；sing-box 内核客户端要用 Hy2 需贴完整证书 PEM（自签证书在 `/usr/local/etc/xray-reality/hy2-cert.pem`），链接里的 pinSHA256 对它们无效。
+- 需要 Xray 核心 ≥ 26.3.27（Hy2 传输 2026 年才进核心），版本不够脚本会直接报错并提示升级核心。
+- **手写 Xray JSON 配置的注意**：26.x 起 `allowInsecure` 已被删除（写了直接报错），证书钉扎改用 `pinnedPeerCertSha256`（单个 hex 字符串，逗号可分隔多个）；旧字段 `pinnedPeerCertificateChainSha256` 会被静默忽略——验证会掉回系统 CA 然后失败。分享链接不受影响，客户端自己会翻译。
+- 另一个 26.x 行为：freedom 出站对 vless/hysteria 等入站**默认拦截内网目标**（防 SSRF），所以经节点访问局域网/内网地址会被黑洞——这是官方默认，不是配置错误。
+
 ## 与 v2ray-agent 的区别（为什么另写一个）
 
-- Xray 版本写死 26.10.31，下载后先用官方 .dgst 校验 SHA2-256 再安装，不追滚动 master；脚本本身版本固定、可全文审计（915 行）。
-- dest 默认 files.pythonhosted.org（Fastly，不在任何已知脚本默认池），不从域名池里随机抽；shortId 首次运行随机生成，不用全网同款模板值。
+- Xray 版本写死 26.10.31，下载后先用官方 .dgst 校验 SHA2-256 再安装，不追滚动 master；脚本本身版本固定、可全文审计。
+- dest 默认 files.pythonhosted.org（Fastly，不在任何已知脚本默认池），不从域名池里随机抽；shortId 首次运行随机生成，不用全网同款模板值。（脚本行数：v1.5 为 915 行，v1.6 加 Hy2 后 1138 行。）
 - minClientVer 默认 26.0.0（严格）：只收当前世代的 Xray 内核客户端，sing-box 系客户端（Karing，其握手里报的是老版本）会被拒绝——旧形状的 ClientHello 在现今流量里更扎眼，这正是要拒的。它不是加密防线（准入靠 REALITY 密钥认证），是伪装新鲜度门槛。注意在 Xray 26.10.31 上把该字段留空等于不检查，所以严格必须写显式版本号。
 - UUID / REALITY 密钥 / shortId 首次生成后存盘（state.env，0600），重跑不换，已导入的客户端不会失效。
 
@@ -101,7 +116,11 @@ sudo bash xray-setup.sh --print-link # 重新打印客户端分享链接
 | `XRAY_DEST_MODE` | `external` | `external`、`self` 或 `both` |
 | `XRAY_AUTO_CERT` | `1` | self/both 缺证书时自动签发（含自动装 acme.sh）；`0` = 不签、直接报错 |
 | `XRAY_FALLBACK` | `python` | self/both 回落站实现：`nginx` = 独立 nginx 实例（原生 h2、生产级并发、更像真站）；选择记入 state，重跑可不带 |
-| `XRAY_DOMAIN` | — | self 模式的域名（必填） |
+| `XRAY_DOMAIN` | — | self 模式的域名（必填）；external 模式下给 Hy2 用域名证书时也填它 |
+| `XRAY_HY2` | state 记录/关 | `on` = 叠加 Hysteria2 入站（UDP）；`off` = 关掉（密码保留在 state，重开链接不变） |
+| `XRAY_HY2_PORT` | `8443` | Hy2 的 UDP 监听端口 |
+| `XRAY_HY2_SNI` | `www.bing.com` | 自签 Hy2 证书的 SNI（用域名证书时忽略） |
+| `XRAY_HY2_CERT`/`XRAY_HY2_KEY` | — | Hy2 显式证书路径（须成对给出） |
 
 示例：换端口 + 放行 Karing：
 
@@ -135,3 +154,4 @@ sudo bash xray-setup.sh --uninstall   # 卸载（只删本包的服务/配置/�
 - v1.3.1 复验：回落站新旧实现 A/B 并发测试（60 并发请求 + 20 个垃圾连接混入）本地均 60/60 通过——回环握手太快，复现不了广域网高延迟下旧实现串行握手的排队问题；本版属预防性加固，不是已实锤的故障修复。注：回落站 ALPN 首选 h2（为像真站），用 curl 探活须加 `--http1.1`，直接 curl 会因 h2 帧不匹配返回 000，那是探针假象、不是回落站故障。
 - v1.5 复验：默认钉版真实下载+哈希校验通过；`XRAY_VERSION=latest` 实查 GitHub API 解析出最新版（当时为 26.10.31）并完成安装；state 读回双向验证——把 CORE_VERSION 人为改成 99.0.0 后重跑，脚本确实按 99.0.0 去下载（证明读回生效、不会降级回钉版），回落站 FALLBACK=nginx 读回同样验证通过。此读回在 v1.4 因 subshell 写法失效（选择记不住、靠每次带参数掩盖），v1.5 修复并在此留档。
 - v1.4 复验：nginx 模式 dry-run（self/both）产物正确（独立实例 unit、nginx 1.24 走 `listen ... ssl http2` 分支、state 记录 FALLBACK=nginx）；生成的 nginx 实例实起验证：HTTP/2 与 HTTP/1.1 均 200、60 并发+垃圾连接混入 60/60；`xr` 菜单实测渲染与状态/链接/切换项正常。联调中发现并修复一个真 bug：安装器 umask 077 使 webroot 目录 700、文件 600，nginx 的 nobody worker 读不到会 404——nginx 分支现显式放开目录穿越与 webroot 读权限（state/私钥仍 600）。REALITY 全链路在沙箱只验到“服务端认证通过并发出 egress 拨号”一步：沙箱出口网关会 reset 直连（python 回落站 A/B 同样如此），完整取数未在沙箱复现，以实机为准。
+- v1.6 复验（Hy2）：字段口径以 v26.10.31 官方源码为准（`infra/conf/hysteria.go`、`transport_security.go`）。助手 VM 出站 UDP 被系统级禁止（sendto: operation not permitted），回环 E2E 改在用户 Mac 上用官方 macOS 版 26.10.31（.dgst 哈希已验）实测四象限：正确 auth+obfs+pin → 经隧道取回公网页面；错 obfs / 错 auth / 错 pin → 全部被拒。过程中两个坑已写进上文专节：`--noproxy '*'` 会让 curl 绕过显式 socks 代理（假阳性教训）；26.x freedom 默认拦截内网目标（测试目标须用公网地址）。脚本侧 dry-run 全过：external+Hy2（自签+pin 链接）、external+Hy2+域名、self+Hy2、both+Hy2、关 Hy2（密码保留）、重跑复用、菜单渲染与第 8 项开关行、核心版本门（26.3.13 被拒）、证书成对校验；生成配置均过真二进制 `xray run -test`。Hy2 生成的入站 JSON 与 Mac 实测通过的配置逐字段一致。

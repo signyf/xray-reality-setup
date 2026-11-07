@@ -42,6 +42,17 @@
 #     not a crypto one: authentication still requires the REALITY keys).
 #     Note: on Xray 26.10.31, omitting the field entirely enforces nothing,
 #     so strictness has to be an explicit version, not an empty value.
+#   - Optional Hysteria2 inbound (XRAY_HY2=on, since v1.6), served by the
+#     SAME Xray process using the core's official solution: protocol
+#     "hysteria" (version 2) over QUIC/TLS, Salamander obfuscation via
+#     finalmask (the official replacement for the old in-protocol obfs),
+#     plus an HTTP/3 masquerade proxy. Auth + obfs passwords are generated
+#     once and kept in state. Certificate: the install's domain cert when
+#     one exists (self/both, or XRAY_DOMAIN given), else a self-signed
+#     cert (SNI www.bing.com) whose link carries pinSHA256. Needs core
+#     >= 26.3.27. NOTE for Xray 26.x raw-JSON configs: allowInsecure was
+#     REMOVED — pinning is now "pinnedPeerCertSha256" (a hex string);
+#     share links are unaffected (clients translate pinSHA256 for you).
 #
 # Usage:
 #   sudo bash xray-setup.sh                      # external dest mode
@@ -75,6 +86,13 @@
 #                      self mode, else auto-detected public IPv4)
 #   XRAY_MIN_CLIENT_VER default 26.0.0 (strict); 1.0.0 = allow sing-box
 #                      clients (Karing); "" = omit the field (no check)
+#   XRAY_HY2           on = also install the Hysteria2 inbound (default:
+#                      whatever state recorded, else off)
+#   XRAY_HY2_PORT      Hy2 UDP listen port        (default 8443)
+#   XRAY_HY2_SNI       SNI for the self-signed Hy2 cert (default
+#                      www.bing.com); ignored when a domain cert is used
+#   XRAY_HY2_CERT/KEY  explicit Hy2 cert paths (default: domain cert if
+#                      any, else a generated self-signed cert)
 
 set -u
 
@@ -91,6 +109,11 @@ XRAY_AUTO_CERT="${XRAY_AUTO_CERT:-1}"
 XRAY_ADDR="${XRAY_ADDR:-}"
 XRAY_MIN_CLIENT_VER="${XRAY_MIN_CLIENT_VER:-26.0.0}"
 XRAY_FALLBACK="${XRAY_FALLBACK:-}"
+XRAY_HY2="${XRAY_HY2:-}"
+XRAY_HY2_PORT="${XRAY_HY2_PORT:-}"
+XRAY_HY2_SNI="${XRAY_HY2_SNI:-}"
+XRAY_HY2_CERT="${XRAY_HY2_CERT:-}"
+XRAY_HY2_KEY="${XRAY_HY2_KEY:-}"
 FALLBACK_PORT=10443
 
 # Testing hooks (not needed on a real VPS):
@@ -138,6 +161,13 @@ SELF_PORT=${SELF_PORT_SAVED:-}
 SELF_SNI=${SELF_SNI_SAVED:-}
 FALLBACK=${FALLBACK_KIND:-python}
 CORE_VERSION=${XRAY_VERSION:-}
+HY2=${HY2:-off}
+HY2_PORT=${HY2_PORT:-}
+HY2_AUTH=${HY2_AUTH:-}
+HY2_OBFS=${HY2_OBFS:-}
+HY2_SNI=${HY2_SNI:-}
+HY2_CERT_MODE=${HY2_CERT_MODE:-}
+HY2_PIN=${HY2_PIN:-}
 EOF
   chmod 600 "$STATE"
 }
@@ -169,6 +199,8 @@ ensure_deps() {
       command -v python3 >/dev/null 2>&1 || missing="$missing python3"
     fi
   fi
+  # openssl: Hy2 self-signed cert generation + pin computation
+  [ "${HY2_ON:-0}" = "1" ] && { command -v openssl >/dev/null 2>&1 || missing="$missing openssl"; }
   [ -z "$missing" ] && return 0
   [ -n "$PREFIX" ] && die "missing tools:$missing (dry run: install them first)"
   if command -v apt-get >/dev/null 2>&1; then
@@ -191,14 +223,19 @@ ensure_deps() {
   esac
 }
 
-open_firewall() { # port... — only when ufw exists and is active
+open_firewall() { # port/proto... — only when ufw exists and is active
   [ -n "$PREFIX" ] && return 0
   command -v ufw >/dev/null 2>&1 || return 0
   ufw status 2>/dev/null | grep -qi '^Status: active' || return 0
   local p
   for p in "$@"; do
-    ufw allow "${p}/tcp" >/dev/null 2>&1 && say "ufw: allowed ${p}/tcp (it was active)."
+    ufw allow "$p" >/dev/null 2>&1 && say "ufw: allowed $p (it was active)."
   done
+}
+
+rand_hex() { # bytes — random hex (openssl preferred, /dev/urandom fallback)
+  if command -v openssl >/dev/null 2>&1; then openssl rand -hex "$1";
+  else od -An -tx1 -N"$1" /dev/urandom | tr -d ' \n'; fi
 }
 
 # ------------------------------------------------------------- download ----
@@ -475,6 +512,38 @@ ${MINLINE}
 EOF
 }
 
+hy2_inbound_json() { # the core's official Hy2: protocol "hysteria" v2,
+  # Salamander via finalmask, masquerade proxy for probe resistance
+  cat <<EOF
+    {
+      "tag": "hy2-in",
+      "listen": "0.0.0.0",
+      "port": ${HY2_PORT},
+      "protocol": "hysteria",
+      "settings": {
+        "version": 2,
+        "users": [ { "auth": "${HY2_AUTH}", "level": 0 } ]
+      },
+      "streamSettings": {
+        "network": "hysteria",
+        "security": "tls",
+        "tlsSettings": {
+          "alpn": [ "h3" ],
+          "certificates": [ { "certificateFile": "${HY2_CERT_FILE}", "keyFile": "${HY2_KEY_FILE}" } ]
+        },
+        "hysteriaSettings": {
+          "version": 2,
+          "masquerade": { "type": "proxy", "url": "https://www.bing.com", "rewriteHost": true }
+        },
+        "finalmask": {
+          "udp": [ { "type": "salamander", "settings": { "password": "${HY2_OBFS}" } } ]
+        }
+      },
+      "sniffing": { "enabled": true, "destOverride": [ "http", "tls", "quic" ], "routeOnly": true }
+    }
+EOF
+}
+
 write_config() {
   local inbounds=""
   case "$XRAY_DEST_MODE" in
@@ -486,6 +555,10 @@ write_config() {
       inbounds="$(inbound_json "$XRAY_PORT" "${XRAY_DEST_HOST}:443" "$XRAY_DEST_HOST"),
 $(inbound_json "$XRAY_SELF_PORT" "127.0.0.1:${FALLBACK_PORT}" "$XRAY_DOMAIN")" ;;
   esac
+  if [ "${HY2:-off}" = "on" ]; then
+    inbounds="${inbounds},
+$(hy2_inbound_json)"
+  fi
   mkdir -p "$CONF_DIR"
   # NOTE: the temp name must end in .json — xray detects the config format
   # from the file extension and refuses ".tmp".
@@ -550,6 +623,13 @@ make_link() { # host port sni tag
   echo "vless://${UUID}@$1:$2?encryption=none&security=reality&sni=$3&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&spx=%2F&type=tcp&flow=xtls-rprx-vision#$4"
 }
 
+make_hy2_link() { # host — pin only for non-domain certs (domain certs
+  # renew, a baked-in pin would break the link at the first renewal)
+  local pin=""
+  [ -n "${HY2_PIN:-}" ] && pin="&pinSHA256=${HY2_PIN}"
+  echo "hysteria2://${HY2_AUTH}@$1:${HY2_PORT}/?sni=${HY2_SNI}&obfs=salamander&obfs-password=${HY2_OBFS}${pin}#xray-hy2"
+}
+
 print_link() {
   local links="" info_blocks=""
   case "$MODE_SAVED" in
@@ -591,6 +671,23 @@ SNI / dest   : ${SELF_SNI_SAVED} (self, local fallback)
 Share link:
 ${lb2}" ;;
   esac
+  local hy2_block=""
+  if [ "${HY2:-off}" = "on" ]; then
+    local hhost="$LINK_HOST_SAVED" hlink
+    [ "${HY2_CERT_MODE:-}" = "domain" ] && hhost="$HY2_SNI"
+    hlink="$(make_hy2_link "$hhost")"
+    links="${links}
+${hlink}"
+    hy2_block="
+[Hysteria2 inbound — same Xray process, official finalmask solution]
+Address      : ${hhost}
+Port         : UDP ${HY2_PORT}
+SNI          : ${HY2_SNI} (cert: ${HY2_CERT_MODE})
+Obfuscation  : salamander (finalmask)
+Share link:
+${hlink}
+"
+  fi
   cat > "${CONF_DIR}/client-info.txt" <<EOF
 Xray VLESS + TCP + REALITY + Vision (standalone)
 ================================================
@@ -604,11 +701,17 @@ Short ID     : ${SHORT_ID}
 minClientVer : ${XRAY_MIN_CLIENT_VER:-(omitted / no version check)}
 
 ${info_blocks}
-
+${hy2_block}
 Notes:
 - Import the link(s) into v2rayN / v2rayNG (Xray core) as-is.
 - minClientVer default 26.0.0 rejects sing-box based clients (Karing);
   re-run with XRAY_MIN_CLIENT_VER=1.0.0 on the server if you need them.
+- Hy2 links need an Xray-core client (v2rayN / v2rayNG). With a
+  self-signed or custom cert the link's pinSHA256 does the verification;
+  sing-box-core clients would need the full cert PEM instead
+  (self-signed cert: ${CONF_DIR}/hy2-cert.pem when present).
+- Xray 26.x freedom blocks private-IP targets by default for these
+  inbounds — the node cannot be used to reach LAN/private addresses.
 - The link(s) contain full credentials. Do not post them publicly.
 EOF
   chmod 600 "${CONF_DIR}/client-info.txt"
@@ -674,6 +777,14 @@ state_env_args() {
       [ "${MODE:-}" = "both" ] && printf 'XRAY_SELF_PORT=%s\n' "${SELF_PORT:-8443}"
       ;;
   esac
+  if [ "${HY2:-off}" = "on" ]; then
+    printf 'XRAY_HY2=on\n'
+    printf 'XRAY_HY2_PORT=%s\n' "${HY2_PORT:-8443}"
+    # external mode has no other place recording the Hy2 domain
+    if [ "${MODE:-}" = "external" ] && [ "${HY2_CERT_MODE:-}" = "domain" ]; then
+      printf 'XRAY_DOMAIN=%s\n' "${HY2_SNI:-}"
+    fi
+  fi
 }
 
 menu_rerun() { # extra-env... — replace this process with a fresh install run
@@ -692,7 +803,10 @@ menu_status() {
     st="$(systemctl is-active "$FALLBACK_SERVICE" 2>/dev/null)"; say "xray-fallback: ${st:-unknown} (impl: ${FALLBACK:-python})"
   fi
   say "-- listeners --"
-  ss -tlnp 2>/dev/null | grep -E ":(${PORT:-443}|${SELF_PORT:-8443}|10443)[[:space:]]" || say "(none matched)"
+  ss -tlnp 2>/dev/null | grep -E ":(${PORT:-443}|${SELF_PORT:-8443}|10443)[[:space:]]" || say "(no tcp matched)"
+  if [ "${HY2:-off}" = "on" ]; then
+    ss -ulnp 2>/dev/null | grep -E ":${HY2_PORT:-8443}[[:space:]]" || say "(hy2 udp ${HY2_PORT:-8443} not listening!)"
+  fi
   if [ -f "${CONF_DIR}/fullchain.pem" ] && command -v openssl >/dev/null 2>&1; then
     say "cert expires: $(openssl x509 -enddate -noout -in "${CONF_DIR}/fullchain.pem" 2>/dev/null | cut -d= -f2)"
   fi
@@ -706,7 +820,8 @@ show_menu() {
   while true; do
     say ""
     say "===== xray-reality menu ====="
-    say "mode: ${MODE:-?}   port: ${PORT:-?}   fallback: ${FALLBACK:-python}"
+    local hy2_disp="off"; [ "${HY2:-off}" = "on" ] && hy2_disp="on (udp ${HY2_PORT:-8443})"
+    say "mode: ${MODE:-?}   port: ${PORT:-?}   fallback: ${FALLBACK:-python}   hy2: ${hy2_disp}"
     say "  1) status"
     say "  2) show client link"
     say "  3) restart services"
@@ -717,7 +832,9 @@ show_menu() {
       other="nginx"; [ "${FALLBACK:-python}" = "nginx" ] && other="python"
       say "  7) switch fallback to ${other}"
     fi
-    say "  8) uninstall"
+    local hy2_next="on"; [ "${HY2:-off}" = "on" ] && hy2_next="off"
+    say "  8) turn Hysteria2 ${hy2_next}"
+    say "  9) uninstall"
     say "  0) exit"
     printf 'choice: '
     read -r choice || return 0
@@ -740,7 +857,9 @@ show_menu() {
       7) [ "${MODE:-}" = "self" ] || [ "${MODE:-}" = "both" ] || { say "external mode has no fallback."; continue; }
          say "Re-running with XRAY_FALLBACK=${other}..."
          menu_rerun "XRAY_FALLBACK=${other}" ;;
-      8) printf 'uninstall everything? [y/N] '; read -r yn || yn=""
+      8) say "Re-running with XRAY_HY2=${hy2_next}..."
+         menu_rerun "XRAY_HY2=${hy2_next}" ;;
+      9) printf 'uninstall everything? [y/N] '; read -r yn || yn=""
          case "$yn" in y|Y) do_uninstall ;; *) say "cancelled." ;; esac ;;
       0) return 0 ;;
       *) say "invalid choice" ;;
@@ -794,6 +913,23 @@ if [ "$XRAY_DEST_MODE" = "both" ]; then
   [ "$XRAY_SELF_PORT" != "$XRAY_PORT" ] || die "both mode needs XRAY_PORT != XRAY_SELF_PORT"
 fi
 
+# ---- Hysteria2 (optional inbound): env wins, then state, else off.
+if [ -z "$XRAY_HY2" ] && [ -f "$STATE" ]; then
+  XRAY_HY2="$( . "$STATE" >/dev/null 2>&1; printf '%s' "${HY2:-}" )"
+fi
+case "$XRAY_HY2" in on|1|yes) HY2_ON=1;; *) HY2_ON=0;; esac
+if [ -z "$XRAY_HY2_PORT" ] && [ -f "$STATE" ]; then
+  XRAY_HY2_PORT="$( . "$STATE" >/dev/null 2>&1; printf '%s' "${HY2_PORT:-}" )"
+fi
+XRAY_HY2_PORT="${XRAY_HY2_PORT:-8443}"
+if [ "$HY2_ON" = "1" ]; then
+  valid_port "$XRAY_HY2_PORT" || die "invalid XRAY_HY2_PORT: $XRAY_HY2_PORT"
+  if [ -n "$XRAY_HY2_CERT" ] && [ ! -f "$XRAY_HY2_CERT" ]; then die "XRAY_HY2_CERT not found: $XRAY_HY2_CERT"; fi
+  if [ -n "$XRAY_HY2_KEY" ] && [ ! -f "$XRAY_HY2_KEY" ]; then die "XRAY_HY2_KEY not found: $XRAY_HY2_KEY"; fi
+  [ -z "$XRAY_HY2_CERT" ] || [ -n "$XRAY_HY2_KEY" ] || die "XRAY_HY2_CERT and XRAY_HY2_KEY must be given together"
+  [ -z "$XRAY_HY2_KEY" ] || [ -n "$XRAY_HY2_CERT" ] || die "XRAY_HY2_CERT and XRAY_HY2_KEY must be given together"
+fi
+
 # Port occupancy: refuse to stomp on someone else's listener.
 check_port_free() {
   if [ -z "$PREFIX" ] && command -v ss >/dev/null 2>&1; then
@@ -804,11 +940,25 @@ check_port_free() {
     fi
   fi
 }
+check_udp_port_free() {
+  if [ -z "$PREFIX" ] && command -v ss >/dev/null 2>&1; then
+    if ss -uln 2>/dev/null | grep -qE "[:.]$1[[:space:]]"; then
+      if ! systemctl is-active --quiet "$SERVICE" 2>/dev/null; then
+        die "UDP port $1 is already in use by something else — change XRAY_HY2_PORT or free it first (a sing-box Hy2 on the same UDP port conflicts: Xray and sing-box cannot share it)"
+      fi
+    fi
+  fi
+}
 check_port_free "$XRAY_PORT"
 [ "$XRAY_DEST_MODE" = "both" ] && check_port_free "$XRAY_SELF_PORT"
+[ "$HY2_ON" = "1" ] && check_udp_port_free "$XRAY_HY2_PORT"
 
 ensure_deps
 resolve_core_version
+# Hysteria2 (transport + protocol) exists in Xray-core since v26.3.27.
+if [ "$HY2_ON" = "1" ] && ! ver_ge "$XRAY_VERSION" "26.3.27"; then
+  die "XRAY_HY2=on needs Xray-core >= 26.3.27 (resolved: $XRAY_VERSION) — re-run with XRAY_VERSION=latest or a newer pinned version"
+fi
 install_xray
 mkdir -p "$CONF_DIR" "$UNIT_DIR"
 
@@ -832,11 +982,15 @@ if [ "$XRAY_DEST_MODE" != "external" ]; then
     local_ecc=""
     case "$CERT_FILE" in *"_ecc/"*) local_ecc="--ecc";; esac
     mkdir -p "$CONF_DIR"
+    # When Hy2 is on it serves this same cert from the Xray process, so a
+    # renewal must restart xray-reality as well as the fallback site.
+    RELOAD_UNITS="$FALLBACK_SERVICE"
+    [ "$HY2_ON" = "1" ] && RELOAD_UNITS="${FALLBACK_SERVICE} ${SERVICE}"
     if "${HOME:-/root}/.acme.sh/acme.sh" --install-cert -d "$XRAY_DOMAIN" $local_ecc \
          --fullchain-file "${CONF_DIR}/fullchain.pem" --key-file "${CONF_DIR}/privkey.pem" \
-         --reloadcmd "systemctl restart ${FALLBACK_SERVICE}" >/dev/null 2>&1; then
+         --reloadcmd "systemctl restart ${RELOAD_UNITS}" >/dev/null 2>&1; then
       CERT_FILE="${CONF_DIR}/fullchain.pem"; KEY_FILE="${CONF_DIR}/privkey.pem"
-      say "acme.sh renewal hook registered (renewed cert -> ${CONF_DIR}, restarts ${FALLBACK_SERVICE})."
+      say "acme.sh renewal hook registered (renewed cert -> ${CONF_DIR}, restarts ${RELOAD_UNITS})."
     else
       warn "acme.sh --install-cert failed; using the cert in place — renewals will need a manual ${FALLBACK_SERVICE} restart."
     fi
@@ -848,6 +1002,32 @@ if [ "$XRAY_DEST_MODE" != "external" ]; then
   if [ -n "$dns_ip" ] && [ -n "$my_ip" ] && [ "$dns_ip" != "$my_ip" ]; then
     warn "$XRAY_DOMAIN resolves to $dns_ip but this server's public IP looks like $my_ip"
   fi
+fi
+# external mode + Hy2 + an explicit domain: Hy2 still wants a real cert —
+# resolve one the same way (acme copies land in CONF_DIR; renewal restarts
+# the main service, which is the process serving Hy2).
+HY2_DOMAIN_CERT_FILE=""; HY2_DOMAIN_KEY_FILE=""
+if [ "$XRAY_DEST_MODE" = "external" ] && [ "$HY2_ON" = "1" ] && [ -n "$XRAY_DOMAIN" ] && [ -z "$XRAY_HY2_CERT" ]; then
+  if hcertpair="$(find_cert "$XRAY_DOMAIN")"; then
+    :
+  elif [ "$XRAY_AUTO_CERT" = "1" ] && issue_cert "$XRAY_DOMAIN" && hcertpair="$(find_cert "$XRAY_DOMAIN")"; then
+    say "Certificate issued for $XRAY_DOMAIN (for Hy2)."
+  else
+    die "no certificate found for $XRAY_DOMAIN (for Hy2) and auto-issue is unavailable or failed — or drop XRAY_DOMAIN to use a self-signed Hy2 cert instead"
+  fi
+  HY2_DOMAIN_CERT_FILE="${hcertpair%% *}"; HY2_DOMAIN_KEY_FILE="${hcertpair##* }"
+  case "$HY2_DOMAIN_CERT_FILE" in
+    "${HOME:-/root}/.acme.sh/"*)
+      h_ecc=""; case "$HY2_DOMAIN_CERT_FILE" in *"_ecc/"*) h_ecc="--ecc";; esac
+      if "${HOME:-/root}/.acme.sh/acme.sh" --install-cert -d "$XRAY_DOMAIN" $h_ecc \
+           --fullchain-file "${CONF_DIR}/fullchain.pem" --key-file "${CONF_DIR}/privkey.pem" \
+           --reloadcmd "systemctl restart ${SERVICE}" >/dev/null 2>&1; then
+        HY2_DOMAIN_CERT_FILE="${CONF_DIR}/fullchain.pem"; HY2_DOMAIN_KEY_FILE="${CONF_DIR}/privkey.pem"
+        say "acme.sh renewal hook registered for the Hy2 cert (restarts ${SERVICE})."
+      else
+        warn "acme.sh --install-cert failed for the Hy2 cert; using it in place — renewals will need a manual ${SERVICE} restart."
+      fi ;;
+  esac
 fi
 case "$XRAY_DEST_MODE" in
   external)
@@ -874,6 +1054,49 @@ else
   gen_credentials
 fi
 
+# ---- Hysteria2: credentials + certificate (state-persistent).
+# When Hy2 is off, whatever state recorded (auth/obfs/port) is written back
+# untouched, so turning it back on later restores the same client link.
+HY2="off"; HY2_CERT_FILE=""; HY2_KEY_FILE=""
+# (HY2_CERT_MODE / HY2_PIN keep whatever load_state read: they describe the
+# stored setup even while Hy2 is off, and menu re-runs rely on them.)
+if [ "$HY2_ON" = "1" ]; then
+  HY2="on"
+  HY2_PORT="$XRAY_HY2_PORT"
+  # HY2_AUTH / HY2_OBFS arrive from state via load_state; generate once.
+  [ -n "${HY2_AUTH:-}" ] || HY2_AUTH="$(rand_hex 16)"
+  [ -n "${HY2_OBFS:-}" ] || HY2_OBFS="$(rand_hex 16)"
+  if [ -n "$XRAY_HY2_CERT" ]; then
+    HY2_CERT_MODE="custom"; HY2_CERT_FILE="$XRAY_HY2_CERT"; HY2_KEY_FILE="$XRAY_HY2_KEY"
+    HY2_SNI="${XRAY_HY2_SNI:-${XRAY_DOMAIN:-www.bing.com}}"
+  elif [ "$XRAY_DEST_MODE" != "external" ]; then
+    HY2_CERT_MODE="domain"; HY2_CERT_FILE="$CERT_FILE"; HY2_KEY_FILE="$KEY_FILE"
+    HY2_SNI="$XRAY_DOMAIN"
+  elif [ -n "$HY2_DOMAIN_CERT_FILE" ]; then
+    HY2_CERT_MODE="domain"; HY2_CERT_FILE="$HY2_DOMAIN_CERT_FILE"; HY2_KEY_FILE="$HY2_DOMAIN_KEY_FILE"
+    HY2_SNI="$XRAY_DOMAIN"
+  else
+    HY2_CERT_MODE="selfsigned"
+    HY2_SNI="${XRAY_HY2_SNI:-www.bing.com}"
+    HY2_CERT_FILE="${CONF_DIR}/hy2-cert.pem"; HY2_KEY_FILE="${CONF_DIR}/hy2-key.pem"
+    if [ ! -f "$HY2_CERT_FILE" ] || [ ! -f "$HY2_KEY_FILE" ]; then
+      openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+        -keyout "$HY2_KEY_FILE" -out "$HY2_CERT_FILE" -days 3650 \
+        -subj "/CN=${HY2_SNI}" -addext "subjectAltName=DNS:${HY2_SNI}" 2>/dev/null \
+        || die "failed to generate the self-signed Hy2 certificate"
+      chmod 600 "$HY2_KEY_FILE"; chmod 644 "$HY2_CERT_FILE"
+      say "Hy2: generated a self-signed certificate (SNI ${HY2_SNI})."
+    fi
+  fi
+  if [ "$HY2_CERT_MODE" != "domain" ]; then
+    # Pin = SHA-256 of the leaf certificate (DER) in hex: what Xray-core
+    # clients verify as pinnedPeerCertSha256; links carry it as pinSHA256.
+    HY2_PIN="$(openssl x509 -in "$HY2_CERT_FILE" -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"
+    [ -n "$HY2_PIN" ] || die "could not compute the Hy2 certificate pin from $HY2_CERT_FILE"
+  fi
+  say "Hy2 inbound: UDP ${HY2_PORT}, SNI ${HY2_SNI}, cert mode ${HY2_CERT_MODE}."
+fi
+
 PORT_SAVED="$XRAY_PORT"; MODE_SAVED="$XRAY_DEST_MODE"; SNI_SAVED="$SNI"; LINK_HOST_SAVED="$LINK_HOST"
 save_state
 
@@ -889,11 +1112,10 @@ if [ -z "$PREFIX" ]; then
   systemctl enable --now "$SERVICE"
   systemctl is-active --quiet "$SERVICE" || { journalctl -u "$SERVICE" -n 30 --no-pager; die "service failed to start"; }
   say "Service ${SERVICE} is running."
-  if [ "$XRAY_DEST_MODE" = "both" ]; then
-    open_firewall "$XRAY_PORT" "$XRAY_SELF_PORT"
-  else
-    open_firewall "$XRAY_PORT"
-  fi
+  fw_args=("${XRAY_PORT}/tcp")
+  [ "$XRAY_DEST_MODE" = "both" ] && fw_args+=("${XRAY_SELF_PORT}/tcp")
+  [ "$HY2_ON" = "1" ] && fw_args+=("${XRAY_HY2_PORT}/udp")
+  open_firewall "${fw_args[@]}"
 else
   say "Dry local run (prefix set): systemd steps skipped."
 fi
@@ -908,8 +1130,9 @@ fi
 print_link
 install_shortcut
 say ""
+hy2_done=""; [ "$HY2_ON" = "1" ] && hy2_done=" and UDP ${XRAY_HY2_PORT} (Hysteria2)"
 if [ "$XRAY_DEST_MODE" = "both" ]; then
-  say "Done. Firewall/cloud panel: allow TCP ${XRAY_PORT} and TCP ${XRAY_SELF_PORT} inbound if this is a fresh box."
+  say "Done. Firewall/cloud panel: allow TCP ${XRAY_PORT} and TCP ${XRAY_SELF_PORT}${hy2_done} inbound if this is a fresh box."
 else
-  say "Done. Firewall/cloud panel: allow TCP ${XRAY_PORT} inbound if this is a fresh box."
+  say "Done. Firewall/cloud panel: allow TCP ${XRAY_PORT}${hy2_done} inbound if this is a fresh box."
 fi
